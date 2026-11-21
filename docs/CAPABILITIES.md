@@ -271,11 +271,11 @@ Noctalia 5.5 的 `ShuffleState` 是**无放回**洗牌：365 张全部看过才�
 
 ### 换机 / 多设备
 
-- `userdata-backup.sh` 备份 `~/.local/state/wallhaven-sync/`（index/DB/history）和
-  `~/.config/wallhaven/`（API key），**不备份 1.4 GiB 图片**。
+- 备份 `~/.local/state/wallhaven-sync/`（index/DB/history）和
+  `~/.config/wallhaven/`（API key），备份工具里**不要包含 1.4 GiB 图片**。
 - 新机器恢复后池目录是空的：先跑 `wallhaven-sync rehydrate`，按索引里的 active ID
   原样重新下载（保留 pin/收藏/展示计数），不要直接 `sync --force-prune`。
-- 也可以手动把 `~/Pictures/壁纸/wallhaven/` 一起拷过去，然后直接 `status`。
+- 也可以手动把 `~/Pictures/wallhaven/` 一起拷过去，然后直接 `status`。
 - **不要把同一个 `library.db`/`index.json` 同时给两台设备用**：SQLite、flock 和
   index 的原子写都假设本地文件系统；实时同步会造成锁失效、路径不一致、两边同时
   replenish 互相覆盖。每台设备各自维护独立的 state；用 collections 做共同保护名单，

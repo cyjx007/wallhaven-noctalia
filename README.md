@@ -220,15 +220,15 @@ wallhaven-sync record               # 给 Noctalia 钩子用
 
 状态目录 `~/.local/state/wallhaven-sync/` 里有 `index.json`（active 元数据）、
 `library.db`（历史/淘汰/pin）、`history.jsonl`。**这三样要备份**（图片可以重新下载）；
-`~/code/.dsh/tools/userdata-backup.sh` 已包含整个目录。
+把它们加入你现有的备份工具即可（restic/Borg/rsync 都行）。
 
 > Wallhaven API 没有 `/favorites` 端点（实测 404），星标收藏不能读也不能写；只有
 > collections 可读，而且需要账号用户名。设置 `services.wallhaven.username` 后，每日
 > replenish 会自动把 collections 里的图 pin 住；也可以手动 `collections --username`
 > 或直接 `pin`。**点星标不算保护，要把图加入 collection。**
 
-**换机**：state 目录（index/DB/history）和 API key 会进 `userdata-backup`，图片不会。
-恢复后跑 `wallhaven-sync rehydrate` 按 ID 重新下载 active 图；或者手动把池目录一起拷过去。
+**换机**：state 目录（index/DB/history）和 API key 要备份，图片不用。恢复后跑
+`wallhaven-sync rehydrate` 按 ID 重新下载 active 图；或者手动把池目录一起拷过去。
 **不要两台设备实时共用同一个 index.json/library.db**——SQLite 和 flock 假设本地文件系统，
 两边同时 replenish 会互相覆盖；每台设备用独立 state，collections 做共同保护名单即可。
 

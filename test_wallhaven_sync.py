@@ -926,14 +926,14 @@ class ReplenishTest(unittest.TestCase):
 class CollectionTest(unittest.TestCase):
     def test_fetch_collection_ids_paginates(self):
         def fake_api(_key, endpoint, params):
-            if endpoint == "collections/cyjx":
+            if endpoint == "collections/alice":
                 return {"data": [{"id": 7}]}
             if params["page"] == "1":
                 return {"data": [{"id": "aaaaaa"}], "meta": {"last_page": 2}}
             return {"data": [{"id": "bbbbbb"}], "meta": {"last_page": 2}}
 
         with mock.patch.object(ws, "api_get", side_effect=fake_api):
-            ids = ws.fetch_collection_ids("key", "cyjx")
+            ids = ws.fetch_collection_ids("key", "alice")
         self.assertEqual(ids, {"aaaaaa", "bbbbbb"})
 
 

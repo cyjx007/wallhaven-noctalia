@@ -82,7 +82,7 @@ in
     username = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;
-      example = "cyjx";
+      example = "alice";
       description = ''
         Wallhaven account name.  When set, the daily replenish job reads the
         account's collections (read-only) and pins their images so they are

@@ -141,7 +141,7 @@ Latest（sorting=date_added）
 
 - **必须备份**：`~/.local/state/wallhaven-sync/`（`index.json`、`library.db`、
   `history.jsonl`）。图片本身可以重新下载，元数据不行。
-- 已在 `~/code/.dsh/tools/userdata-backup.sh` 的复制清单里。
+- 把 state 目录加入你现有的备份工具（restic/Borg/rsync 均可）。
 - SQLite 使用 WAL；复制时把 `library.db-wal` / `library.db-shm` 一起复制（整个
   目录 `cp -a` 即可），SQLite 恢复时会自动重放。
 
