@@ -165,6 +165,7 @@ Noctalia 提供 `NOCTALIA_WALLPAPER_PATH` / `NOCTALIA_WALLPAPER_CONNECTOR`。
 wallhaven-sync replenish               # 每日滚动窗口（timer 调用的就是它）
 wallhaven-sync replenish --dry-run     # 只显示淘汰计划和候选
 wallhaven-sync replenish --max-per-day 12
+wallhaven-sync replenish --max-bytes 3G   # 池子硬上限
 wallhaven-sync replenish --evict-unshown   # 允许淘汰从未展示的图
 
 wallhaven-sync sync                    # 只补齐到 target（不淘汰）
@@ -172,6 +173,7 @@ wallhaven-sync sync --dry-run          # 只列候选，不写索引/不下载
 wallhaven-sync sync --retry-rejected   # 调阈值后重新评估硬拒绝
 wallhaven-sync sync --retry-duplicates # 重新评估 pHash/SHA 重复
 wallhaven-sync sync --force-prune      # 池子大量缺失时仍继续（危险）
+wallhaven-sync sync --max-bytes 3G    # 到容量上限停止下载
 
 wallhaven-sync status [--json]         # 数量、磁盘、色相、DB、回收站、轮换进度
 wallhaven-sync doctor                  # key/pool/DB/钩子/Noctalia/Umbriel/最近日志
@@ -182,7 +184,7 @@ wallhaven-sync add <id|url> [--force]  # 手动加一张；仍做 SHA/pHash 去�
 wallhaven-sync ban <id>                # 删除并永久拉黑
 wallhaven-sync pin <id> / unpin <id>   # 保护/取消保护
 wallhaven-sync pins                    # 列出 pin 的图
-wallhaven-sync restore <id>            # 从回收站或重新下载恢复
+wallhaven-sync restore <id> [--force]  # 从回收站或重新下载恢复（超容量需 --force）
 wallhaven-sync trash [--purge --days N] # 查看/清理回收站
 wallhaven-sync collections --username NAME  # 收藏夹里的图全部 pin（只读）
 
@@ -271,7 +273,7 @@ Noctalia 5.5 的 `ShuffleState` 是**无放回**洗牌：365 张全部看过才�
 Home Manager 模块提供：
 
 - `wallhaven-sync.service`（oneshot，`Nice=10`，`TimeoutStartSec=6h`），
-  `ExecStart = wallhaven-sync replenish --max-per-day 24 --keep-trash-days 7`；
+  `ExecStart = wallhaven-sync replenish --max-per-day 24 --keep-trash-days 7 --max-bytes 3221225472`；
 - `wallhaven-sync.timer`：每天一次 + 登录 5 分钟后一次，`Persistent=true`；
 - 首次运行会补满整个池子，之后才是每日滚动；
 - 设置了 `keyFile` 时，`ConditionPathExists` 会让没有 key 的服务直接跳过。

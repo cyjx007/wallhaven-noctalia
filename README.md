@@ -189,6 +189,7 @@ wallhaven-sync dedupe --apply         # 隔离距离 ≤3 的重复（4–7 只�
 ```bash
 wallhaven-sync replenish            # 每日滚动窗口：淘汰 24 张 + 补 24 张
 wallhaven-sync replenish --dry-run  # 只看计划
+wallhaven-sync replenish --max-bytes 3G  # 池子硬上限
 wallhaven-sync sync                 # 只补齐到 target
 wallhaven-sync sync --dry-run       # 只列候选，不写索引
 wallhaven-sync sync --retry-rejected
