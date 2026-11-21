@@ -57,6 +57,27 @@ in
         engine as the shell.
       '';
     };
+
+    maxPerDay = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 24;
+      description = ''
+        How many images the daily rolling window may evict (and replace) per
+        day.  `0` disables eviction and only tops up the pool.  The first run
+        still fills the whole pool; later runs keep the pool at `target` while
+        rotating roughly `maxPerDay` images per day.
+      '';
+    };
+
+    trashDays = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 7;
+      description = ''
+        Evicted images are moved to `<poolDir>-trash/YYYYMM/` and deleted after
+        this many days (`0` keeps them forever).  `wallhaven-sync restore <id>`
+        can bring them back before they are purged.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -70,7 +91,7 @@ in
       };
       Service = {
         Type = "oneshot";
-        ExecStart = "${package}/bin/wallhaven-sync sync";
+        ExecStart = "${package}/bin/wallhaven-sync replenish --max-per-day ${toString cfg.maxPerDay} --keep-trash-days ${toString cfg.trashDays}";
         Environment = [ "PYTHONUNBUFFERED=1" ];
         Nice = 10;
         IOSchedulingClass = "idle";

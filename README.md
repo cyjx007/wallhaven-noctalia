@@ -6,7 +6,9 @@
 wallhaven API → 本地壁纸池 → Noctalia 轮换 → Material You 调色 → 全系统模板
 ```
 
-- 采集器只做一件事：按排行榜挑图、去重、品控、填满池子（默认 365 张）。
+- 采集器只做一件事：按排行榜/标签挑图、去重、品控、填满池子（默认 365 张）。
+- **滚动窗口**：每天淘汰一批已经看过的旧图，补入新图，active 始终约 365 张；
+  被淘汰的图进 7 天回收站，元数据留在 SQLite，可 `restore` 回来。
 - 轮换和调色全部交给 [Noctalia](https://github.com/noctalia-dev/noctalia)：它自带
   **无放回洗牌**（`wallpaper_shuffle.json`），365 张全部看过才开下一轮。
 - 换壁纸时 Noctalia 重新生成调色板，并通过模板写 GTK、kitty、ghostty、btop、bat、
@@ -40,6 +42,8 @@ services.wallhaven = {
   target = 365;
   poolDir = "${config.home.homeDirectory}/Pictures/wallhaven";
   noctaliaPackage = config.programs.noctalia.package; # 可选，用于调色板品控
+  maxPerDay = 24;    # 每天淘汰/补入的张数（0 = 只补不淘汰）
+  trashDays = 7;     # 淘汰图在 <poolDir>-trash/ 保留几天
 };
 ```
 
@@ -119,7 +123,27 @@ Material You 本身保证文本对比度（实测 `on_surface/surface` 约 14:1�
 `hue-quota` / `muted-quota` 是**软拒绝**：不写永久黑名单，第一遍结束后若没满，
 自动进入宽松模式再补一遍。硬拒绝（太亮/太暗/太平/太大）才会永久跳过。
 
-## 展示历史
+## 滚动窗口（每天换 24 张）
+
+池子满 365 张后，`replenish` 不再只是“池满即退”，而是：
+
+```
+选最久没展示的旧图 → 先补新图（允许临时超出 target）
+→ 只淘汰真正补到的数量 → 移到 <poolDir>-trash/YYYYMM/
+→ DB 标记 evicted → 7 天后清理文件
+```
+
+- 默认 24 张/天，约 3 GB/月；`--max-per-day` 或模块选项 `maxPerDay` 可调。
+- **当前正在显示的壁纸不会被删**：用 `noctalia msg wallpaper-get` 确认，失败时默认放弃淘汰。
+- 从未展示过的图默认不淘汰；`--evict-unshown` 才允许。
+- 先补后删：网络失败时一张旧图都不删。
+- 被淘汰的 ID/pHash 留在 SQLite，不会重新下载回来。
+- `pin <id>` 永不淘汰；`restore <id>` 从回收站或 Wallhaven 恢复。
+
+首次运行仍然是补满 365 张；之后 systemd 每天调用一次 `replenish`，登录 5 分钟后也会跑一次，
+但同一天不会超过 `maxPerDay`。
+
+## 展示历史与元数据库
 
 在 Noctalia 配置里加一条钩子：
 
@@ -158,15 +182,24 @@ wallhaven-sync dedupe --apply         # 隔离距离 ≤3 的重复（4–7 只�
 ## 命令
 
 ```bash
-wallhaven-sync sync                 # 补齐到 target
+wallhaven-sync replenish            # 每日滚动窗口：淘汰 24 张 + 补 24 张
+wallhaven-sync replenish --dry-run  # 只看计划
+wallhaven-sync sync                 # 只补齐到 target
 wallhaven-sync sync --dry-run       # 只列候选，不写索引
 wallhaven-sync sync --retry-rejected
 wallhaven-sync sync --retry-duplicates
-wallhaven-sync status [--json]      # 数量、磁盘、色相、pHash、历史、轮换进度
-wallhaven-sync doctor               # key/pool/Noctalia/Umbriel/最近日志
+wallhaven-sync status [--json]      # 数量、磁盘、色相、DB、回收站、轮换进度
+wallhaven-sync doctor               # key/DB/钩子/Noctalia/Umbriel/最近日志
+wallhaven-sync backfill             # 回填旧索引缺少的 URL/收藏数/标签
 wallhaven-sync preview <文件|id>    # 终端色块 + 亮度
 wallhaven-sync add <id|url>         # 手动加一张（--force 跳过品控）
 wallhaven-sync ban <id>             # 删除并拉黑
+wallhaven-sync pin <id>             # 永不自动淘汰
+wallhaven-sync unpin <id>
+wallhaven-sync pins                 # 列出保护名单
+wallhaven-sync restore <id>         # 从回收站或重新下载
+wallhaven-sync trash [--purge]      # 查看/清理回收站
+wallhaven-sync collections --username NAME  # 收藏夹只读保护名单
 wallhaven-sync dedupe [--apply]     # pHash 去重
 wallhaven-sync dedupe --list-quarantine
 wallhaven-sync dedupe --restore <id>
@@ -175,7 +208,15 @@ wallhaven-sync report               # 统计报告
 wallhaven-sync record               # 给 Noctalia 钩子用
 ```
 
-完整能力见 [docs/CAPABILITIES.md](docs/CAPABILITIES.md)。
+完整能力见 [docs/CAPABILITIES.md](docs/CAPABILITIES.md)，架构与不变量见
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+
+状态目录 `~/.local/state/wallhaven-sync/` 里有 `index.json`（active 元数据）、
+`library.db`（历史/淘汰/pin）、`history.jsonl`。**这三样要备份**（图片可以重新下载）；
+`~/code/.dsh/tools/userdata-backup.sh` 已包含整个目录。
+
+> Wallhaven API 没有 `/favorites` 端点（实测 404），只有 collections 可读，而且需要账号
+> 用户名。`collections --username` 是唯一的“只读收藏夹保护”，也可以直接 `pin`。
 
 API 用 `X-API-Key` 请求头，限流 1.4s/次；索引与图片都在本地，不进 git。
 

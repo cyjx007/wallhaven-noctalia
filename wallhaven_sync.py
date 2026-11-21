@@ -32,6 +32,7 @@ import math
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -40,7 +41,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 API_ROOT = "https://wallhaven.cc/api/v1"
@@ -50,7 +51,23 @@ SCHEME = "m3-content"
 DEFAULT_TARGET = 365
 MAX_DOWNLOAD_BYTES = 16 * 1024 * 1024
 TOPLIST_RANGES = ("1M", "3M", "6M", "1y")
+SOURCE_TAGS = (
+    "landscape",
+    "city",
+    "abstract",
+    "minimal",
+    "space",
+    "nature",
+    "architecture",
+    "cyberpunk",
+)
+LATEST_MIN_FAVORITES = 100
+LATEST_MIN_VIEWS = 2000
+DEFAULT_MAX_PER_DAY = 24
+DEFAULT_TRASH_DAYS = 7
+DB_VERSION = 1
 API_DELAY = 1.4  # wallhaven 限流 45 次/分钟；1.4s 约 43 次
+_last_api_call = 0.0
 DOWNLOAD_DELAY = 0.25
 
 # Quality gates.  Material You already guarantees text/background contrast
@@ -113,6 +130,14 @@ class Paths:
     @property
     def history(self) -> Path:
         return self.state / "history.jsonl"
+
+    @property
+    def db(self) -> Path:
+        return self.state / "library.db"
+
+    @property
+    def trash(self) -> Path:
+        return self.pool.parent / f"{self.pool.name}-trash"
 
     @property
     def quarantine(self) -> Path:
@@ -179,6 +204,444 @@ def exclusive_lock(path: Path, shared: bool = False):
 
 
 # --------------------------------------------------------------------------- #
+# metadata database (SQLite)
+# --------------------------------------------------------------------------- #
+
+DB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS images (
+    id TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'active',
+    file TEXT,
+    file_type TEXT,
+    source TEXT,
+    theme TEXT,
+    width INTEGER,
+    height INTEGER,
+    resolution TEXT,
+    bytes INTEGER,
+    sha256 TEXT,
+    phash TEXT,
+    luma REAL,
+    stddev REAL,
+    sat REAL,
+    primary_color TEXT,
+    hue INTEGER,
+    chroma INTEGER,
+    favorites INTEGER,
+    views INTEGER,
+    category TEXT,
+    purity TEXT,
+    url TEXT,
+    thumb_url TEXT,
+    tags TEXT,
+    added_at TEXT,
+    first_shown_at TEXT,
+    last_shown_at TEXT,
+    shown_count INTEGER NOT NULL DEFAULT 0,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    evicted_at TEXT,
+    evicted_reason TEXT,
+    trash_path TEXT
+);
+CREATE TABLE IF NOT EXISTS display_history (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT,
+    shown_at TEXT,
+    connector TEXT,
+    source TEXT,
+    path TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_images_status ON images(status);
+CREATE INDEX IF NOT EXISTS idx_images_phash ON images(phash);
+CREATE INDEX IF NOT EXISTS idx_images_hue ON images(hue);
+CREATE INDEX IF NOT EXISTS idx_images_last_shown ON images(last_shown_at);
+CREATE INDEX IF NOT EXISTS idx_history_id ON display_history(id);
+"""
+
+
+def db_init(conn: sqlite3.Connection) -> None:
+    conn.executescript(DB_SCHEMA)
+    # Forward-only, additive migrations for databases created by older versions.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(images)")}
+    for name, declaration in (
+        ("file_type", "TEXT"),
+        ("theme", "TEXT"),
+        ("trash_path", "TEXT"),
+    ):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE images ADD COLUMN {name} {declaration}")
+    if conn.execute("PRAGMA user_version").fetchone()[0] < DB_VERSION:
+        conn.execute(f"PRAGMA user_version = {DB_VERSION}")
+
+
+@contextlib.contextmanager
+def open_db(paths: Paths, timeout: float = 5.0):
+    paths.state.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(paths.db, timeout=timeout)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        db_init(conn)
+        yield conn
+    finally:
+        conn.close()
+
+
+def entry_metadata(item: dict, source: str) -> dict:
+    """Collect the API fields worth keeping.  Tags are filled in at eviction."""
+    thumbs = item.get("thumbs") or {}
+    return {
+        "source": source,
+        "theme": theme_for_source(source),
+        "width": item.get("dimension_x"),
+        "height": item.get("dimension_y"),
+        "resolution": item.get("resolution"),
+        "file_type": item.get("file_type"),
+        "url": item.get("url"),
+        "thumb_url": thumbs.get("large") or thumbs.get("original"),
+        "favorites": item.get("favorites"),
+        "views": item.get("views"),
+        "category": item.get("category"),
+        "purity": item.get("purity"),
+        "created_at": item.get("created_at"),
+    }
+
+
+def theme_for_source(source: str) -> str:
+    if source.startswith("tag:"):
+        return source.split(":", 3)[1]
+    if source.startswith("latest"):
+        return "latest"
+    if source.startswith("toplist"):
+        return "toplist"
+    if source.startswith("restored"):
+        return "restored"
+    return "manual"
+
+
+def _entry_values(image_id: str, entry: dict, status: str) -> dict:
+    stats = entry.get("stats") or {}
+    palette = entry.get("palette") or {}
+    tags = entry.get("tags")
+    if isinstance(tags, list):
+        tags = json.dumps(tags, ensure_ascii=False)
+    return {
+        "id": image_id,
+        "status": status,
+        "file": entry.get("file"),
+        "file_type": entry.get("file_type"),
+        "source": entry.get("source"),
+        "theme": entry.get("theme"),
+        "width": entry.get("width"),
+        "height": entry.get("height"),
+        "resolution": entry.get("resolution"),
+        "bytes": entry.get("bytes"),
+        "sha256": entry.get("sha256"),
+        "phash": entry.get("phash"),
+        "luma": stats.get("luma"),
+        "stddev": stats.get("stddev"),
+        "sat": stats.get("sat"),
+        "primary_color": palette.get("primary"),
+        "hue": palette.get("hue"),
+        "chroma": palette.get("chroma"),
+        "favorites": entry.get("favorites"),
+        "views": entry.get("views"),
+        "category": entry.get("category"),
+        "purity": entry.get("purity"),
+        "url": entry.get("url"),
+        "thumb_url": entry.get("thumb_url"),
+        "tags": tags,
+        "added_at": entry.get("added_at"),
+    }
+
+
+def db_upsert_entry(conn: sqlite3.Connection, image_id: str, entry: dict, status: str = "active") -> None:
+    values = _entry_values(image_id, entry, status)
+    columns = ", ".join(values)
+    placeholders = ", ".join(f":{name}" for name in values)
+    conn.execute(
+        f"INSERT INTO images ({columns}) VALUES ({placeholders}) "
+        "ON CONFLICT(id) DO UPDATE SET "
+        "status=excluded.status, file=excluded.file, source=excluded.source, "
+        "file_type=COALESCE(excluded.file_type, images.file_type), "
+        "theme=COALESCE(excluded.theme, images.theme), "
+        "width=COALESCE(excluded.width, images.width), height=COALESCE(excluded.height, images.height), "
+        "resolution=COALESCE(excluded.resolution, images.resolution), "
+        "bytes=COALESCE(excluded.bytes, images.bytes), "
+        "sha256=COALESCE(excluded.sha256, images.sha256), "
+        "phash=COALESCE(excluded.phash, images.phash), "
+        "luma=COALESCE(excluded.luma, images.luma), "
+        "stddev=COALESCE(excluded.stddev, images.stddev), sat=COALESCE(excluded.sat, images.sat), "
+        "primary_color=COALESCE(excluded.primary_color, images.primary_color), "
+        "hue=COALESCE(excluded.hue, images.hue), chroma=COALESCE(excluded.chroma, images.chroma), "
+        "favorites=COALESCE(excluded.favorites, images.favorites), "
+        "views=COALESCE(excluded.views, images.views), "
+        "category=COALESCE(excluded.category, images.category), "
+        "purity=COALESCE(excluded.purity, images.purity), "
+        "url=COALESCE(excluded.url, images.url), "
+        "thumb_url=COALESCE(excluded.thumb_url, images.thumb_url), "
+        "tags=COALESCE(excluded.tags, images.tags), "
+        "added_at=COALESCE(images.added_at, excluded.added_at), "
+        "first_shown_at=COALESCE(images.first_shown_at, excluded.first_shown_at), "
+        "last_shown_at=COALESCE(images.last_shown_at, excluded.last_shown_at), "
+        "evicted_at=CASE WHEN excluded.status = 'active' THEN NULL ELSE images.evicted_at END, "
+        "evicted_reason=CASE WHEN excluded.status = 'active' THEN NULL ELSE images.evicted_reason END, "
+        "trash_path=CASE WHEN excluded.status = 'active' THEN NULL ELSE images.trash_path END",
+        values,
+    )
+
+
+def mirror_index_to_db(paths: Paths, index: dict) -> None:
+    """Mirror index.json into SQLite; rows that left the index become evicted."""
+    try:
+        with open_db(paths) as conn:
+            for image_id, entry in index["images"].items():
+                db_upsert_entry(conn, image_id, entry, "active")
+            active_ids = set(index["images"])
+            stamp = now()
+            for row in conn.execute("SELECT id FROM images WHERE status = 'active'").fetchall():
+                if row["id"] not in active_ids:
+                    conn.execute(
+                        "UPDATE images SET status='evicted', evicted_at=?, "
+                        "evicted_reason=COALESCE(evicted_reason, 'missing') WHERE id = ?",
+                        (stamp, row["id"]),
+                    )
+            conn.commit()
+    except sqlite3.Error as exc:
+        warn(f"元数据库同步失败：{exc}")
+
+
+def db_blockers(paths: Paths) -> tuple[set[str], dict[str, str], dict[str, str]]:
+    """IDs, pHashes and SHA-256 values of images that must not be downloaded again."""
+    ids: set[str] = set()
+    phashes: dict[str, str] = {}
+    shas: dict[str, str] = {}
+    if not paths.db.exists():
+        return ids, phashes, shas
+    try:
+        with open_db(paths) as conn:
+            for row in conn.execute(
+                "SELECT id, phash, sha256 FROM images WHERE status != 'active'"
+            ):
+                ids.add(row["id"])
+                if row["phash"]:
+                    phashes[row["id"]] = row["phash"]
+                if row["sha256"]:
+                    shas[row["sha256"]] = row["id"]
+    except sqlite3.Error as exc:
+        warn(f"读取元数据库失败：{exc}")
+    return ids, phashes, shas
+
+
+def db_set_status(
+    paths: Paths,
+    image_id: str,
+    status: str,
+    reason: str | None = None,
+    trash_path: str | None = None,
+) -> None:
+    try:
+        with open_db(paths) as conn:
+            conn.execute(
+                "UPDATE images SET status = ?, evicted_at = ?, evicted_reason = ?, "
+                "trash_path = COALESCE(?, trash_path) WHERE id = ?",
+                (status, now() if status != "active" else None, reason, trash_path, image_id),
+            )
+            if status == "active":
+                conn.execute(
+                    "UPDATE images SET evicted_at = NULL, evicted_reason = NULL, "
+                    "trash_path = NULL WHERE id = ?",
+                    (image_id,),
+                )
+            conn.commit()
+    except sqlite3.Error as exc:
+        warn(f"更新 {image_id} 状态失败：{exc}")
+
+
+def db_record_display(paths: Paths, image_id: str, connector: str | None, path: str) -> None:
+    """Best-effort hook write: raw event + shown_count.  Never raises."""
+    try:
+        with open_db(paths, timeout=1.0) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT OR IGNORE INTO images (id, status, file, source) VALUES (?, 'active', ?, 'noctalia')",
+                (image_id, Path(path).name),
+            )
+            last = conn.execute(
+                "SELECT id, connector FROM display_history ORDER BY seq DESC LIMIT 1"
+            ).fetchone()
+            repeated = bool(last and last["id"] == image_id and last["connector"] == connector)
+            conn.execute(
+                "INSERT INTO display_history (id, shown_at, connector, source, path) "
+                "VALUES (?, ?, ?, 'noctalia', ?)",
+                (image_id, now(), connector, path),
+            )
+            if not repeated:
+                stamp = now()
+                conn.execute(
+                    "UPDATE images SET shown_count = shown_count + 1, "
+                    "first_shown_at = COALESCE(first_shown_at, ?), "
+                    "last_shown_at = ? WHERE id = ?",
+                    (stamp, stamp, image_id),
+                )
+            conn.commit()
+    except sqlite3.Error as exc:
+        warn(f"元数据库记录失败：{exc}")
+
+
+def db_get(paths: Paths, image_id: str) -> dict | None:
+    if not paths.db.exists():
+        return None
+    try:
+        with open_db(paths) as conn:
+            row = conn.execute("SELECT * FROM images WHERE id = ?", (image_id,)).fetchone()
+            return dict(row) if row else None
+    except sqlite3.Error as exc:
+        warn(f"读取元数据库失败：{exc}")
+        return None
+
+
+def db_pinned(paths: Paths) -> set[str]:
+    if not paths.db.exists():
+        return set()
+    try:
+        with open_db(paths) as conn:
+            return {
+                row["id"]
+                for row in conn.execute("SELECT id FROM images WHERE pinned = 1").fetchall()
+            }
+    except sqlite3.Error as exc:
+        warn(f"读取 pin 列表失败：{exc}")
+        return set()
+
+
+def db_set_pinned(paths: Paths, image_id: str, pinned: bool) -> bool:
+    try:
+        with open_db(paths) as conn:
+            cursor = conn.execute(
+                "UPDATE images SET pinned = ? WHERE id = ?",
+                (1 if pinned else 0, image_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+    except sqlite3.Error as exc:
+        warn(f"更新 pin 失败：{exc}")
+        return False
+
+
+def db_pin_ids(paths: Paths, image_ids: set[str]) -> int:
+    total = 0
+    try:
+        with open_db(paths) as conn:
+            for image_id in image_ids:
+                total += conn.execute(
+                    "UPDATE images SET pinned = 1 WHERE id = ?", (image_id,)
+                ).rowcount
+            conn.commit()
+    except sqlite3.Error as exc:
+        warn(f"批量 pin 失败：{exc}")
+    return total
+
+
+def db_counts(paths: Paths) -> dict[str, int]:
+    counts = {"active": 0, "evicted": 0, "quarantine": 0, "banned": 0, "pinned": 0}
+    if not paths.db.exists():
+        return counts
+    try:
+        with open_db(paths) as conn:
+            for row in conn.execute("SELECT status, COUNT(*) AS n FROM images GROUP BY status"):
+                counts[str(row["status"])] = int(row["n"])
+            counts["pinned"] = int(
+                conn.execute("SELECT COUNT(*) FROM images WHERE pinned = 1").fetchone()[0]
+            )
+    except sqlite3.Error:
+        pass
+    return counts
+
+
+def db_eviction_rows(paths: Paths) -> list[dict]:
+    """Active rows used to choose least-recently-shown victims."""
+    if not paths.db.exists():
+        return []
+    try:
+        with open_db(paths) as conn:
+            return [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT id, last_shown_at, added_at, pinned FROM images WHERE status = 'active'"
+                )
+            ]
+    except sqlite3.Error as exc:
+        warn(f"读取淘汰候选失败：{exc}")
+        return []
+
+
+def db_recently_shown(paths: Paths, hours: float) -> set[str]:
+    if hours <= 0 or not paths.db.exists():
+        return set()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).replace(microsecond=0).isoformat()
+    try:
+        with open_db(paths) as conn:
+            return {
+                row["id"]
+                for row in conn.execute(
+                    "SELECT id FROM images WHERE last_shown_at IS NOT NULL AND last_shown_at >= ?",
+                    (cutoff,),
+                )
+            }
+    except sqlite3.Error as exc:
+        warn(f"读取最近展示记录失败：{exc}")
+        return set()
+
+
+def db_evicted_today(paths: Paths) -> int:
+    if not paths.db.exists():
+        return 0
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        with open_db(paths) as conn:
+            return int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM images WHERE evicted_at LIKE ? AND evicted_reason = 'rotation'",
+                    (f"{today}%",),
+                ).fetchone()[0]
+            )
+    except sqlite3.Error:
+        return 0
+
+
+def db_update_tags(paths: Paths, image_id: str, tags: list[str]) -> None:
+    try:
+        with open_db(paths) as conn:
+            conn.execute(
+                "UPDATE images SET tags = ? WHERE id = ?",
+                (json.dumps(tags, ensure_ascii=False), image_id),
+            )
+            conn.commit()
+    except sqlite3.Error as exc:
+        warn(f"写入 {image_id} 标签失败：{exc}")
+
+
+def db_recent_evictions(paths: Paths, limit: int = 5) -> list[dict]:
+    if not paths.db.exists():
+        return []
+    try:
+        with open_db(paths) as conn:
+            return [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT id, evicted_at, evicted_reason, shown_count, favorites, views "
+                    "FROM images WHERE status = 'evicted' "
+                    "ORDER BY evicted_at DESC LIMIT ?",
+                    (limit,),
+                )
+            ]
+    except sqlite3.Error:
+        return []
+
+
+# --------------------------------------------------------------------------- #
 # wallhaven API / download
 # --------------------------------------------------------------------------- #
 
@@ -197,6 +660,7 @@ def read_key(paths: Paths) -> str:
 
 
 def api_get(key: str, endpoint: str, params: dict) -> dict:
+    global _last_api_call
     url = f"{API_ROOT}/{endpoint}?" + urllib.parse.urlencode(params)
     headers = {
         "User-Agent": USER_AGENT,
@@ -206,6 +670,12 @@ def api_get(key: str, endpoint: str, params: dict) -> dict:
     }
     last_error: Exception | None = None
     for attempt in range(1, 4):
+        # Central rate limit: every endpoint (search, w/{id}, collections) shares
+        # the same 45/min budget, so the delay belongs here, not in the caller.
+        wait = API_DELAY - (time.monotonic() - _last_api_call)
+        if wait > 0:
+            time.sleep(wait)
+        _last_api_call = time.monotonic()
         try:
             request = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(request, timeout=30) as response:
@@ -514,34 +984,99 @@ def api_reject_reason(item: dict) -> str | None:
 # --------------------------------------------------------------------------- #
 
 
-def iter_candidates(key: str, max_pages: int | None = None):
+def _source_tag_list(args: argparse.Namespace) -> list[str]:
+    if getattr(args, "no_tags", False):
+        return []
+    raw = getattr(args, "tags", ",".join(SOURCE_TAGS))
+    return [tag.strip().lower() for tag in str(raw).split(",") if tag.strip()]
+
+
+def build_sources(args: argparse.Namespace) -> list[dict]:
+    """Build the search sources for one run, rotated by day.
+
+    The 1M toplist alone has only ~591 usable candidates, so a rolling window
+    needs more ranges and tag searches.  Rotating the order keeps every run
+    from spending its API budget on the same first pages.
+    """
+    common = {
+        "purity": "100",
+        "categories": "100",
+        "ratios": "16x9",
+        "atleast": "1920x1080",
+    }
+    min_favorites = int(getattr(args, "min_favorites", 0) or 0)
+    min_views = int(getattr(args, "min_views", 0) or 0)
+    sources: list[dict] = []
     for toplist_range in TOPLIST_RANGES:
-        page = 1
-        last_page = 1
-        while page <= last_page:
-            params = {
-                "sorting": "toplist",
-                "topRange": toplist_range,
-                "purity": "100",
-                "categories": "100",
-                "ratios": "16x9",
-                "atleast": "1920x1080",
-                "page": str(page),
+        sources.append(
+            {
+                "label": f"toplist:{toplist_range}",
+                "params": {**common, "sorting": "toplist", "topRange": toplist_range},
+                "min_favorites": min_favorites,
+                "min_views": min_views,
             }
+        )
+        for tag in _source_tag_list(args):
+            sources.append(
+                {
+                    "label": f"tag:{tag}:{toplist_range}",
+                    "params": {
+                        **common,
+                        "sorting": "toplist",
+                        "topRange": toplist_range,
+                        "q": f"+{tag}",
+                    },
+                    "min_favorites": min_favorites,
+                    "min_views": min_views,
+                }
+            )
+    if getattr(args, "include_latest", True):
+        sources.append(
+            {
+                "label": "latest",
+                "params": {**common, "sorting": "date_added", "order": "desc"},
+                "min_favorites": max(min_favorites, LATEST_MIN_FAVORITES),
+                "min_views": max(min_views, LATEST_MIN_VIEWS),
+            }
+        )
+    if sources:
+        offset = datetime.now().toordinal() % len(sources)
+        sources = sources[offset:] + sources[:offset]
+    return sources
+
+
+def iter_candidates(
+    key: str,
+    max_pages: int | None = None,
+    sources: list[dict] | None = None,
+    page_offset: int = 0,
+):
+    if sources is None:
+        sources = build_sources(argparse.Namespace())
+    for source in sources:
+        page = 1 + max(0, page_offset)
+        last_page = page
+        while page <= last_page:
+            params = dict(source["params"])
+            params["page"] = str(page)
+            label = source["label"]
             try:
                 payload = api_get(key, "search", params)
             except RuntimeError as exc:
                 # 一个榜单失败不拖垮后面的范围；下一次 sync 会重新尝试。
-                warn(f"{toplist_range}: {exc}")
+                warn(f"{label}: {exc}")
                 break
             meta = payload.get("meta") or {}
             last_page = int(meta.get("last_page") or page)
             for item in payload.get("data") or []:
-                yield item, f"toplist:{toplist_range}:p{page}"
-            if max_pages is not None and page >= max_pages:
+                if int(item.get("favorites") or 0) < source["min_favorites"]:
+                    continue
+                if int(item.get("views") or 0) < source["min_views"]:
+                    continue
+                yield item, f"{source['label']}:p{page}"
+            if max_pages is not None and page - (1 + max(0, page_offset)) + 1 >= max_pages:
                 break
             page += 1
-            time.sleep(API_DELAY)
 
 
 def cleanup_incoming(paths: Paths) -> None:
@@ -581,6 +1116,10 @@ def sync_locked(paths: Paths, args: argparse.Namespace) -> int:
     target = args.target
     key = read_key(paths)
     dry_run = args.dry_run
+    if not dry_run:
+        mirror_index_to_db(paths, index)
+    blocker_ids, blocker_phashes, blocker_shas = db_blockers(paths)
+    sources = build_sources(args)
 
     if index.get("target") != target:
         index["target"] = target
@@ -664,7 +1203,12 @@ def sync_locked(paths: Paths, args: argparse.Namespace) -> int:
                 break
             print("进入宽松模式：忽略色相/饱和度配额，继续补齐。", flush=True)
 
-        for item, source in iter_candidates(key, args.max_pages):
+        for item, source in iter_candidates(
+            key,
+            args.max_pages,
+            sources=sources,
+            page_offset=int(getattr(args, "page_offset", 0) or 0),
+        ):
             if len(index["images"]) >= target:
                 break
             image_id = item.get("id")
@@ -676,6 +1220,7 @@ def sync_locked(paths: Paths, args: argparse.Namespace) -> int:
                 or image_id in index["rejected"]
                 or image_id in dup_blocked
                 or image_id in index.get("quarantine", {})
+                or image_id in blocker_ids
             ):
                 continue
 
@@ -690,7 +1235,8 @@ def sync_locked(paths: Paths, args: argparse.Namespace) -> int:
             if dry_run:
                 print(
                     f"[dry-run] {image_id} {item.get('resolution')} "
-                    f"{int(item.get('file_size') or 0) // 1024} KiB {source}",
+                    f"{int(item.get('file_size') or 0) // 1024} KiB "
+                    f"fav={item.get('favorites')} views={item.get('views')} {source}",
                     flush=True,
                 )
                 if considered >= args.limit:
@@ -716,6 +1262,16 @@ def sync_locked(paths: Paths, args: argparse.Namespace) -> int:
                 index["duplicates"][image_id] = {"of": duplicate_of, "at": now()}
                 save_index(paths, index)
                 continue
+            archived = blocker_shas.get(digest)
+            if archived:
+                temporary.unlink(missing_ok=True)
+                index["rejected"][image_id] = {
+                    "reason": "duplicate-of-archived",
+                    "of": archived,
+                    "at": now(),
+                }
+                save_index(paths, index)
+                continue
 
             try:
                 stats = image_stats(temporary)
@@ -738,7 +1294,7 @@ def sync_locked(paths: Paths, args: argparse.Namespace) -> int:
             if phash:
                 near_duplicate = None
                 near_distance = None
-                for existing_id, existing_hash in phashes.items():
+                for existing_id, existing_hash in list(phashes.items()) + list(blocker_phashes.items()):
                     distance = phash_distance(phash, existing_hash)
                     if distance <= PHASH_AUTO_DUPLICATE and (
                         near_distance is None or distance < near_distance
@@ -747,12 +1303,20 @@ def sync_locked(paths: Paths, args: argparse.Namespace) -> int:
                         near_distance = distance
                 if near_duplicate:
                     temporary.unlink(missing_ok=True)
-                    index["duplicates"][image_id] = {
-                        "of": near_duplicate,
-                        "distance": near_distance,
-                        "at": now(),
-                        "phash": phash,
-                    }
+                    if near_duplicate in index["images"]:
+                        index["duplicates"][image_id] = {
+                            "of": near_duplicate,
+                            "distance": near_distance,
+                            "at": now(),
+                            "phash": phash,
+                        }
+                    else:
+                        index["rejected"][image_id] = {
+                            "reason": "near-duplicate-of-archived",
+                            "of": near_duplicate,
+                            "distance": near_distance,
+                            "at": now(),
+                        }
                     save_index(paths, index)
                     continue
 
@@ -769,10 +1333,9 @@ def sync_locked(paths: Paths, args: argparse.Namespace) -> int:
             final = paths.pool / f"wallhaven-{image_id}{extension_for(item)}"
             os.replace(temporary, final)
             index["images"][image_id] = {
+                **entry_metadata(item, source),
                 "file": final.name,
-                "source": source,
                 "added_at": now(),
-                "resolution": item.get("resolution"),
                 "bytes": size,
                 "sha256": digest,
                 "phash": phash,
@@ -799,6 +1362,7 @@ def sync_locked(paths: Paths, args: argparse.Namespace) -> int:
 
     if not dry_run:
         save_index(paths, index)
+        mirror_index_to_db(paths, index)
     print(
         f"完成：池子 {len(index['images'])}/{target} 张，本次新增 {accepted} 张，"
         f"候选 {considered} 个，配额延后 {deferred} 张，永久拒绝 {len(index['rejected'])} 个。",
@@ -816,6 +1380,557 @@ def cmd_sync(paths: Paths, args: argparse.Namespace) -> int:
             print("另一个 wallhaven-sync 正在运行，跳过。", flush=True)
             return 0
         return sync_locked(paths, args)
+
+
+# --------------------------------------------------------------------------- #
+# rolling window: evict -> trash -> replenish
+# --------------------------------------------------------------------------- #
+
+
+def current_wallpaper_ids() -> set[str] | None:
+    """IDs currently on screen.  None means unknown and must block eviction."""
+    values: list[str] = []
+    env_path = os.environ.get("NOCTALIA_WALLPAPER_PATH", "").strip()
+    if env_path:
+        values.append(env_path)
+    noctalia = shutil.which("noctalia")
+    if noctalia:
+        try:
+            output = run([noctalia, "msg", "wallpaper-get"], timeout=20)
+        except (RuntimeError, OSError, subprocess.SubprocessError):
+            if not values:
+                return None
+        else:
+            values.extend(line.strip() for line in output.splitlines() if line.strip())
+    if not values:
+        return None
+    ids: set[str] = set()
+    for value in values:
+        image_id = pool_id_from_filename(Path(value).name)
+        if image_id:
+            ids.add(image_id)
+    return ids
+
+
+def trash_files(paths: Paths) -> list[Path]:
+    if not paths.trash.is_dir():
+        return []
+    return sorted(
+        (path for path in paths.trash.rglob("*") if path.is_file()),
+        key=lambda path: path.stat().st_mtime,
+    )
+
+
+def purge_trash(paths: Paths, days: int, dry_run: bool = False) -> list[Path]:
+    """Delete trash files older than `days`; remove empty month directories."""
+    removed: list[Path] = []
+    if days <= 0 or not paths.trash.is_dir():
+        return removed
+    cutoff = time.time() - days * 86400
+    for path in trash_files(paths):
+        try:
+            if path.stat().st_mtime >= cutoff:
+                continue
+            if dry_run:
+                print(f"[dry-run] 将删除 {path} ({format_bytes(path.stat().st_size)})")
+            else:
+                size = path.stat().st_size
+                path.unlink()
+                print(f"清理回收站 {path.name}（{format_bytes(size)}）")
+            removed.append(path)
+        except OSError as exc:
+            warn(f"清理 {path} 失败：{exc}")
+    if not dry_run:
+        for directory in sorted(paths.trash.rglob("*"), reverse=True):
+            if directory.is_dir():
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
+    return removed
+
+
+def select_victims(
+    paths: Paths,
+    index: dict,
+    limit: int,
+    protect: set[str],
+    include_unshown: bool = False,
+    protect_recent_hours: float = 2.0,
+) -> list[str]:
+    """Least-recently-shown active images, never the current wallpaper or pins.
+
+    Images whose file is already gone are skipped (sync will prune them).
+    Never-shown images are only considered with include_unshown: evicting them
+    would mean they were never displayed at all.
+    """
+    if limit <= 0:
+        return []
+    rows = {row["id"]: row for row in db_eviction_rows(paths)}
+    recent = db_recently_shown(paths, protect_recent_hours)
+    history_last: dict[str, str] = {}
+    if len(rows) < len(index["images"]):
+        # Partial DB (first run / dry-run): fall back to history.jsonl for IDs
+        # that are not mirrored yet, without writing anything.
+        for event in read_history(paths):
+            if event.get("in_pool") and event.get("id"):
+                history_last[str(event["id"])] = str(event.get("at") or "")
+    shown: list[tuple[str, str]] = []
+    unseen: list[tuple[str, str]] = []
+    for image_id, entry in index["images"].items():
+        if image_id in protect or image_id in recent:
+            continue
+        row = rows.get(image_id) or {}
+        if row.get("pinned"):
+            continue
+        last_shown = row.get("last_shown_at") or history_last.get(image_id)
+        if last_shown:
+            shown.append((str(last_shown), image_id))
+        elif include_unshown:
+            unseen.append((str(entry.get("added_at") or row.get("added_at") or ""), image_id))
+    shown.sort()
+    unseen.sort()
+    ordered = [image_id for _, image_id in shown]
+    if include_unshown:
+        ordered.extend(image_id for _, image_id in unseen)
+    return ordered[:limit]
+
+
+def evict_batch(paths: Paths, index: dict, victims: list[str], args: argparse.Namespace) -> list[str]:
+    """Move victims to <pool>-trash/YYYYMM and mark them evicted in the DB."""
+    if not victims:
+        return []
+    destination_dir = paths.trash / datetime.now().strftime("%Y%m")
+    if args.dry_run:
+        for image_id in victims:
+            entry = index["images"].get(image_id) or {}
+            file = entry.get("file", "?")
+            size = int(entry.get("bytes") or 0)
+            print(f"[dry-run] 淘汰 {image_id}  {file}  {format_bytes(size)}")
+        return []
+    try:
+        destination_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        warn(f"无法创建回收站 {destination_dir}：{exc}")
+        return []
+    evicted: list[str] = []
+    for image_id in victims:
+        entry = index["images"].get(image_id)
+        if not entry:
+            continue
+        source = paths.pool / entry["file"]
+        if not source.exists():
+            warn(f"淘汰 {image_id} 失败：{source} 不存在")
+            continue
+        destination = destination_dir / entry["file"]
+        try:
+            if source.stat().st_dev != destination_dir.stat().st_dev:
+                shutil.move(str(source), str(destination))
+            else:
+                os.replace(source, destination)
+        except OSError as exc:
+            warn(f"移动 {source} 到回收站失败：{exc}")
+            continue
+        try:
+            # The image may have been in the pool for months; age the trash
+            # entry from the eviction, not from the original download.
+            os.utime(destination, None)
+        except OSError as exc:
+            warn(f"更新 {destination} 时间戳失败：{exc}")
+        del index["images"][image_id]
+        try:
+            save_index(paths, index)
+        except OSError as exc:
+            index["images"][image_id] = entry
+            warn(f"保存索引失败，回滚 {image_id}: {exc}")
+            try:
+                shutil.move(str(destination), str(source))
+            except OSError as rollback:
+                warn(f"回滚文件失败：{rollback}")
+            continue
+        db_set_status(paths, image_id, "evicted", reason="rotation", trash_path=str(destination))
+        evicted.append(image_id)
+        print(f"淘汰 {image_id} -> {destination}")
+    return evicted
+
+
+def enrich_evicted_tags(paths: Paths, key: str, image_ids: list[str]) -> None:
+    """Search results omit tags; fetch each evicted image once (≤24/day)."""
+    for image_id in image_ids:
+        try:
+            item = fetch_item(key, image_id)
+        except (RuntimeError, SystemExit) as exc:
+            warn(f"补全 {image_id} 标签失败：{exc}")
+            continue
+        tags = [str(tag.get("name")) for tag in item.get("tags") or [] if tag.get("name")]
+        if tags:
+            db_update_tags(paths, image_id, tags)
+
+
+def cmd_replenish(paths: Paths, args: argparse.Namespace) -> int:
+    """Daily rolling window: plan victims, top up, then move victims to trash."""
+    with exclusive_lock(paths.lock) as acquired:
+        if not acquired:
+            print("另一个 wallhaven-sync 正在运行，跳过。", flush=True)
+            return 0
+        index = load_index(paths)
+        if not args.dry_run:
+            mirror_index_to_db(paths, index)
+        purge_trash(paths, args.keep_trash_days, dry_run=args.dry_run)
+
+        already = db_evicted_today(paths)
+        budget = max(0, args.max_per_day - already)
+        if args.max_per_day > 0 and already >= args.max_per_day:
+            print(f"今天已淘汰 {already}/{args.max_per_day} 张，本次只补货。", flush=True)
+
+        protect: set[str] = set()
+        planned: list[str] = []
+        if budget > 0:
+            current = current_wallpaper_ids()
+            if current is None:
+                if args.force:
+                    warn("无法确定当前壁纸，--force 继续（可能删掉正在显示的图）")
+                else:
+                    warn("无法确定当前壁纸（noctalia msg wallpaper-get 失败），跳过淘汰；确认后加 --force")
+                    budget = 0
+            else:
+                protect = current
+        if budget > 0:
+            planned = select_victims(
+                paths,
+                index,
+                budget,
+                protect,
+                include_unshown=args.evict_unshown,
+                protect_recent_hours=args.protect_recent_hours,
+            )
+        if budget > 0 and not planned:
+            print("没有可淘汰的旧图（未展示过的图默认不淘汰）。", flush=True)
+        for image_id in planned:
+            entry = index["images"].get(image_id) or {}
+            print(
+                f"{'[dry-run] ' if args.dry_run else ''}候选淘汰 {image_id}  "
+                f"{entry.get('file', '?')}",
+                flush=True,
+            )
+
+        page_offset = args.page_offset
+        if page_offset is None or page_offset < 0:
+            page_offset = datetime.now().toordinal() % 20
+        sync_args = argparse.Namespace(
+            target=args.target + len(planned),
+            dry_run=args.dry_run,
+            retry_rejected=False,
+            retry_duplicates=False,
+            force_prune=False,
+            max_pages=args.max_pages,
+            page_offset=page_offset,
+            limit=args.limit,
+            tags=args.tags,
+            no_tags=args.no_tags,
+            include_latest=args.include_latest,
+            min_favorites=args.min_favorites,
+            min_views=args.min_views,
+        )
+        result = sync_locked(paths, sync_args)
+        if result != 0 or args.dry_run or not planned:
+            return result
+
+        index = load_index(paths)
+        if index.get("target") != args.target:
+            # sync ran with target+planned (overshoot); keep the user-facing
+            # target at the real pool size.
+            index["target"] = args.target
+            save_index(paths, index)
+        surplus = max(0, len(index["images"]) - args.target)
+        if surplus <= 0:
+            print("没有补到新图，保留所有旧图。", flush=True)
+            return 0
+        victims = [image_id for image_id in planned if image_id in index["images"]][:surplus]
+        evicted = evict_batch(paths, index, victims, args)
+        if evicted:
+            key = read_key(paths)
+            enrich_evicted_tags(paths, key, evicted)
+            print(f"本轮淘汰 {len(evicted)} 张，补货后池子 {len(index['images'])} 张。", flush=True)
+        return 0
+
+
+def cmd_backfill(paths: Paths, args: argparse.Namespace) -> int:
+    """Fill url/width/favorites/tags for entries downloaded before 1.1."""
+    index = load_index(paths)
+    targets = [
+        image_id
+        for image_id, entry in index["images"].items()
+        if args.force or not entry.get("url") or not entry.get("tags")
+    ]
+    if args.limit:
+        targets = targets[: args.limit]
+    if not targets:
+        print("所有 active 图的元数据都已完整。")
+        return 0
+    if args.dry_run:
+        print(f"[dry-run] 需要回填 {len(targets)} 张：{' '.join(targets[:20])}")
+        return 0
+    key = read_key(paths)
+    with exclusive_lock(paths.lock) as acquired:
+        if not acquired:
+            raise SystemExit("另一个 wallhaven-sync 正在运行")
+        index = load_index(paths)
+        updated = 0
+        for image_id in targets:
+            entry = index["images"].get(image_id)
+            if not entry:
+                continue
+            try:
+                item = fetch_item(key, image_id)
+            except (RuntimeError, SystemExit) as exc:
+                warn(f"{image_id} 回填失败：{exc}")
+                continue
+            source = entry.get("source") or "manual"
+            patch = entry_metadata(item, source)
+            patch["theme"] = entry.get("theme") or patch["theme"]
+            patch["tags"] = [
+                str(tag.get("name")) for tag in item.get("tags") or [] if tag.get("name")
+            ]
+            for name, value in patch.items():
+                if value is not None:
+                    entry[name] = value
+            updated += 1
+            if updated % 20 == 0:
+                save_index(paths, index)
+            print(f"[{updated}/{len(targets)}] {image_id} {entry.get('resolution')} tags={len(patch['tags'])}", flush=True)
+        save_index(paths, index)
+        mirror_index_to_db(paths, index)
+    print(f"回填完成：{updated} 张。")
+    return 0
+
+
+def cmd_db_checkpoint(paths: Paths, _args: argparse.Namespace) -> int:
+    """Flush the WAL so a plain copy of library.db is self-contained."""
+    if not paths.db.exists():
+        print("还没有 library.db，无需处理。")
+        return 0
+    try:
+        with open_db(paths) as conn:
+            result = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            conn.commit()
+    except sqlite3.Error as exc:
+        warn(f"checkpoint 失败：{exc}")
+        return 1
+    print(f"library.db 已 checkpoint：{paths.db}（{tuple(result)}）")
+    return 0
+
+
+def cmd_trash(paths: Paths, args: argparse.Namespace) -> int:
+    if args.purge:
+        removed = purge_trash(paths, args.days, dry_run=args.dry_run)
+        if args.dry_run:
+            print(f"[dry-run] 将清理 {len(removed)} 个文件。")
+        else:
+            print(f"清理完成：删除 {len(removed)} 个文件。")
+        return 0
+    files = trash_files(paths)
+    if not files:
+        print(f"回收站是空的（{paths.trash}）。")
+        return 0
+    total = 0
+    for path in files:
+        try:
+            size = path.stat().st_size
+            stamp = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        except OSError:
+            continue
+        total += size
+        print(f"{stamp}  {size:>10}  {path.relative_to(paths.trash)}")
+    print(f"合计 {len(files)} 个文件，{format_bytes(total)}；{args.days} 天后自动清理。")
+
+
+def cmd_pin(paths: Paths, args: argparse.Namespace) -> int:
+    with exclusive_lock(paths.lock) as acquired:
+        if not acquired:
+            raise SystemExit("另一个 wallhaven-sync 正在运行")
+        index = load_index(paths)
+        image_id = parse_wallpaper_id(args.id) or args.id
+        if image_id not in index["images"]:
+            row = db_get(paths, image_id)
+            if row and row.get("status") != "active":
+                raise SystemExit(f"{image_id} 已被淘汰，先执行 wallhaven-sync restore {image_id}")
+            raise SystemExit(f"{image_id} 不在池子里")
+        mirror_index_to_db(paths, index)
+        if not db_set_pinned(paths, image_id, True):
+            raise SystemExit(f"无法 pin {image_id}（元数据库里没有记录）")
+        print(f"已 pin {image_id}（永不自动淘汰）")
+    return 0
+
+
+def cmd_unpin(paths: Paths, args: argparse.Namespace) -> int:
+    image_id = parse_wallpaper_id(args.id) or args.id
+    if not db_set_pinned(paths, image_id, False):
+        raise SystemExit(f"元数据库里没有 {image_id}")
+    print(f"已取消 pin {image_id}")
+    return 0
+
+
+def cmd_pins(paths: Paths, _args: argparse.Namespace) -> int:
+    if not paths.db.exists():
+        print("还没有元数据库记录。")
+        return 0
+    with open_db(paths) as conn:
+        rows = conn.execute(
+            "SELECT id, status, file, last_shown_at FROM images WHERE pinned = 1 ORDER BY id"
+        ).fetchall()
+    if not rows:
+        print("没有 pin 的图。")
+        return 0
+    for row in rows:
+        print(f"{row['id']}  {row['status']:<9} {row['file'] or '?':<28} 最近展示 {row['last_shown_at'] or '从未'}")
+    return 0
+
+
+def db_row_to_entry(row: dict) -> dict:
+    stats = {}
+    for key in ("luma", "stddev", "sat"):
+        if row.get(key) is not None:
+            stats[key] = row[key]
+    palette = None
+    if row.get("primary_color"):
+        palette = {
+            "primary": row["primary_color"],
+            "hue": row.get("hue"),
+            "chroma": row.get("chroma"),
+        }
+    tags = None
+    if row.get("tags"):
+        try:
+            tags = json.loads(row["tags"])
+        except json.JSONDecodeError:
+            tags = None
+    return {
+        "file": row.get("file"),
+        "source": row.get("source") or "restored",
+        "theme": row.get("theme") or "restored",
+        "width": row.get("width"),
+        "height": row.get("height"),
+        "resolution": row.get("resolution"),
+        "bytes": row.get("bytes"),
+        "sha256": row.get("sha256"),
+        "phash": row.get("phash"),
+        "stats": stats,
+        "palette": palette,
+        "file_type": row.get("file_type"),
+        "favorites": row.get("favorites"),
+        "views": row.get("views"),
+        "category": row.get("category"),
+        "purity": row.get("purity"),
+        "url": row.get("url"),
+        "thumb_url": row.get("thumb_url"),
+        "tags": tags,
+        "added_at": row.get("added_at") or now(),
+    }
+
+
+def cmd_restore(paths: Paths, args: argparse.Namespace) -> int:
+    image_id = parse_wallpaper_id(args.id) or args.id
+    with exclusive_lock(paths.lock) as acquired:
+        if not acquired:
+            raise SystemExit("另一个 wallhaven-sync 正在运行")
+        index = load_index(paths)
+        if image_id in index["images"]:
+            print(f"{image_id} 已经在池子里。")
+            return 0
+        row = db_get(paths, image_id)
+        if row and row.get("status") == "banned":
+            raise SystemExit(f"{image_id} 已被拉黑；先手动编辑索引里的 banned 再恢复")
+        if row and row.get("file") and (paths.pool / row["file"]).exists():
+            # The file was put back manually; just re-attach the metadata.
+            entry = db_row_to_entry(row)
+            index["images"][image_id] = entry
+            save_index(paths, index)
+            db_set_status(paths, image_id, "active")
+            print(f"{image_id} 的文件已在池中，已重新挂到索引。")
+            return 0
+        source = Path(row["trash_path"]) if row and row.get("trash_path") else None
+        if source and source.exists():
+            paths.pool.mkdir(parents=True, exist_ok=True)
+            destination = paths.pool / (row.get("file") or source.name)
+            try:
+                if source.stat().st_dev != paths.pool.stat().st_dev:
+                    shutil.move(str(source), str(destination))
+                else:
+                    os.replace(source, destination)
+            except OSError as exc:
+                raise SystemExit(f"从回收站恢复 {source} 失败：{exc}") from exc
+            entry = db_row_to_entry(row)
+            entry["file"] = destination.name
+            index["images"][image_id] = entry
+            save_index(paths, index)
+            db_set_status(paths, image_id, "active")
+            print(f"已从回收站恢复 {image_id} -> {destination}")
+            return 0
+        key = read_key(paths)
+        item = fetch_item(key, image_id)
+        if not add_item(
+            paths, index, item, "restored", args.target, force=True, allow_archived=True
+        ):
+            raise SystemExit(f"重新下载 {image_id} 失败")
+        db_set_status(paths, image_id, "active")
+        print(f"已重新下载 {image_id}")
+    return 0
+
+
+def cmd_collections(paths: Paths, args: argparse.Namespace) -> int:
+    """Pin every wallpaper in the user's wallhaven collections (read-only).
+
+    Wallhaven's API has no favourites endpoint (404); collections are the only
+    readable list.  Item listings need the account username, which the API does
+    not expose, so it must come from --username or WALLHAVEN_USERNAME.
+    """
+    username = args.username or os.environ.get("WALLHAVEN_USERNAME", "").strip()
+    if not username:
+        raise SystemExit(
+            "需要 wallhaven 用户名（API 不返回账号名）："
+            "--username <名字> 或设置 WALLHAVEN_USERNAME"
+        )
+    key = read_key(paths)
+    collected: set[str] = set()
+    try:
+        listing = api_get(key, f"collections/{username}", {})
+    except RuntimeError as exc:
+        raise SystemExit(f"读取 {username} 的收藏夹失败：{exc}") from exc
+    for collection in listing.get("data") or []:
+        collection_id = collection.get("id")
+        if collection_id is None:
+            continue
+        page = 1
+        last_page = 1
+        while page <= last_page:
+            try:
+                payload = api_get(
+                    key,
+                    f"collections/{username}/{collection_id}",
+                    {"page": str(page)},
+                )
+            except RuntimeError as exc:
+                warn(f"读取收藏夹 {collection_id} 第 {page} 页失败：{exc}")
+                break
+            meta = payload.get("meta") or {}
+            last_page = int(meta.get("last_page") or page)
+            for item in payload.get("data") or []:
+                if item.get("id"):
+                    collected.add(str(item["id"]))
+            page += 1
+    if not collected:
+        print("收藏夹是空的，或用户名不对。")
+        return 0
+    pinned = 0
+    with exclusive_lock(paths.lock) as acquired:
+        if not acquired:
+            raise SystemExit("另一个 wallhaven-sync 正在运行")
+        index = load_index(paths)
+        mirror_index_to_db(paths, index)
+        pinned = db_pin_ids(paths, collected)
+    print(f"收藏夹共 {len(collected)} 张，其中 {pinned} 张在库里，已标记 pin。")
+    return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -925,6 +2040,15 @@ def cmd_status(paths: Paths, args: argparse.Namespace) -> int:
     pool_events = [e for e in events if e.get("in_pool") and e.get("id")]
     shown = {str(e["id"]) for e in pool_events} & set(images)
     phash_ready = sum(1 for entry in images.values() if entry.get("phash"))
+    library = db_counts(paths)
+    evicted_today = db_evicted_today(paths)
+    trash = trash_files(paths)
+    trash_bytes = 0
+    for path in trash:
+        try:
+            trash_bytes += path.stat().st_size
+        except OSError:
+            pass
 
     if args.json:
         payload = {
@@ -941,6 +2065,9 @@ def cmd_status(paths: Paths, args: argparse.Namespace) -> int:
             "phash": phash_ready,
             "shown": len(shown),
             "history_events": len(pool_events),
+            "library": library,
+            "trash": {"files": len(trash), "bytes": trash_bytes},
+            "evicted_today": evicted_today,
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
@@ -950,6 +2077,11 @@ def cmd_status(paths: Paths, args: argparse.Namespace) -> int:
     print(f"拒绝      {len(index['rejected'])} 个    重复 {len(index['duplicates'])} 个    拉黑 {len(index['banned'])} 个")
     print(f"指纹      pHash {phash_ready}/{len(images)} 张    隔离 {len(index.get('quarantine', {}))} 张")
     print(f"展示      已看过 {len(shown)} 张 / 从未 {max(0, len(images) - len(shown))} 张（历史 {len(pool_events)} 条）")
+    print(
+        f"库        已淘汰 {library.get('evicted', 0)} 张    pin {library.get('pinned', 0)} 张"
+        f"    今日淘汰 {evicted_today} 张"
+    )
+    print(f"回收站    {len(trash)} 个文件 / {format_bytes(trash_bytes)}（{paths.trash}）")
 
     buckets = hue_buckets(index)
     print("色相分布  " + " ".join(f"{i * 30:3d}°:{count:2d}" for i, count in enumerate(buckets)))
@@ -1057,6 +2189,44 @@ def cmd_doctor(paths: Paths, _args: argparse.Namespace) -> int:
             warn_check(f"pool 里有 {len(orphans)} 个索引外的文件（例如 {orphans[0]}）")
     except SystemExit as exc:
         bad(str(exc))
+
+    print("library")
+    if paths.db.exists():
+        try:
+            with open_db(paths) as conn:
+                check = conn.execute("PRAGMA quick_check").fetchone()[0]
+            counts = db_counts(paths)
+            if check == "ok":
+                ok(
+                    f"{paths.db}（active {counts.get('active', 0)} / "
+                    f"evicted {counts.get('evicted', 0)} / pin {counts.get('pinned', 0)}）"
+                )
+            else:
+                bad(f"元数据库完整性检查失败：{check}")
+        except sqlite3.Error as exc:
+            bad(f"元数据库无法打开：{exc}")
+    else:
+        warn_check("还没有 library.db（首次 sync/replenish 后生成）")
+    if paths.trash.is_dir():
+        files = trash_files(paths)
+        size = 0
+        for path in files:
+            try:
+                size += path.stat().st_size
+            except OSError:
+                pass
+        ok(f"回收站 {len(files)} 个文件 / {format_bytes(size)}（{paths.trash}）")
+    else:
+        ok("回收站还不存在（还没有淘汰过）")
+    if shutil.which("noctalia"):
+        try:
+            hooks = run(["noctalia", "msg", "config-get", "hooks"], timeout=20)
+            if "wallpaper_changed" in hooks and "wallhaven-sync record" in hooks:
+                ok("wallpaper_changed 钩子已接到 wallhaven-sync record")
+            else:
+                bad("wallpaper_changed 钩子没有指向 wallhaven-sync record")
+        except Exception as exc:  # noqa: BLE001
+            warn_check(f"无法读取 hooks 配置：{exc}")
 
     print("tools")
     for binary in ("magick", "noctalia"):
@@ -1184,6 +2354,11 @@ def cmd_ban(paths: Paths, args: argparse.Namespace) -> int:
             raise SystemExit("另一个 wallhaven-sync 正在运行")
         index = load_index(paths)
         image_id = args.id
+        current = current_wallpaper_ids()
+        if current and image_id in current and not args.force:
+            raise SystemExit(
+                f"{image_id} 正在显示；先换一张壁纸，或加 --force 强制删除"
+            )
         entry = index["images"].pop(image_id, None)
         index["banned"][image_id] = {"at": now(), "reason": args.reason or "manual"}
         if entry:
@@ -1192,6 +2367,8 @@ def cmd_ban(paths: Paths, args: argparse.Namespace) -> int:
         else:
             print(f"{image_id} 不在池子里，只加入黑名单")
         save_index(paths, index)
+        db_set_status(paths, image_id, "banned", reason=args.reason or "manual")
+        mirror_index_to_db(paths, index)
     return 0
 
 
@@ -1217,7 +2394,15 @@ def parse_wallpaper_id(raw: str) -> str | None:
     return None
 
 
-def add_item(paths: Paths, index: dict, item: dict, source: str, target: int, force: bool = False) -> bool:
+def add_item(
+    paths: Paths,
+    index: dict,
+    item: dict,
+    source: str,
+    target: int,
+    force: bool = False,
+    allow_archived: bool = False,
+) -> bool:
     image_id = item["id"]
     duplicate = index["duplicates"].get(image_id)
     if (
@@ -1228,6 +2413,14 @@ def add_item(paths: Paths, index: dict, item: dict, source: str, target: int, fo
     ):
         print(f"{image_id} 已在池中、被拉黑、重复或隔离")
         return False
+    blocker_ids: set[str] = set()
+    blocker_phashes: dict[str, str] = {}
+    blocker_shas: dict[str, str] = {}
+    if not allow_archived:
+        blocker_ids, blocker_phashes, blocker_shas = db_blockers(paths)
+        if image_id in blocker_ids:
+            print(f"{image_id} 已被淘汰或拉黑（restore 可恢复）")
+            return False
     reason = api_reject_reason(item)
     if reason:
         print(f"{image_id} 未通过初筛：{reason}")
@@ -1248,6 +2441,16 @@ def add_item(paths: Paths, index: dict, item: dict, source: str, target: int, fo
             save_index(paths, index)
             print(f"{image_id} 与 {existing_id} 内容相同，跳过")
             return False
+    if archive_id := blocker_shas.get(digest):
+        temporary.unlink(missing_ok=True)
+        index["rejected"][image_id] = {
+            "reason": "duplicate-of-archived",
+            "of": archive_id,
+            "at": now(),
+        }
+        save_index(paths, index)
+        print(f"{image_id} 与已淘汰的 {archive_id} 内容相同，跳过")
+        return False
     try:
         phash = image_phash(temporary)
     except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
@@ -1256,10 +2459,13 @@ def add_item(paths: Paths, index: dict, item: dict, source: str, target: int, fo
     if phash:
         near_duplicate = None
         near_distance = None
-        for existing_id, entry in index["images"].items():
-            if not entry.get("phash"):
-                continue
-            distance = phash_distance(phash, entry["phash"])
+        active_hashes = {
+            existing_id: entry["phash"]
+            for existing_id, entry in index["images"].items()
+            if entry.get("phash")
+        }
+        for existing_id, existing_hash in list(active_hashes.items()) + list(blocker_phashes.items()):
+            distance = phash_distance(phash, existing_hash)
             if distance <= PHASH_AUTO_DUPLICATE and (
                 near_distance is None or distance < near_distance
             ):
@@ -1267,12 +2473,20 @@ def add_item(paths: Paths, index: dict, item: dict, source: str, target: int, fo
                 near_distance = distance
         if near_duplicate:
             temporary.unlink(missing_ok=True)
-            index["duplicates"][image_id] = {
-                "of": near_duplicate,
-                "distance": near_distance,
-                "at": now(),
-                "phash": phash,
-            }
+            if near_duplicate in index["images"]:
+                index["duplicates"][image_id] = {
+                    "of": near_duplicate,
+                    "distance": near_distance,
+                    "at": now(),
+                    "phash": phash,
+                }
+            else:
+                index["rejected"][image_id] = {
+                    "reason": "near-duplicate-of-archived",
+                    "of": near_duplicate,
+                    "distance": near_distance,
+                    "at": now(),
+                }
             save_index(paths, index)
             print(f"{image_id} 与 {near_duplicate} 视觉重复（距离 {near_distance}），跳过")
             return False
@@ -1286,10 +2500,9 @@ def add_item(paths: Paths, index: dict, item: dict, source: str, target: int, fo
     final = paths.pool / f"wallhaven-{image_id}{extension_for(item)}"
     os.replace(temporary, final)
     index["images"][image_id] = {
+        **entry_metadata(item, source),
         "file": final.name,
-        "source": source,
         "added_at": now(),
-        "resolution": item.get("resolution"),
         "bytes": size,
         "sha256": digest,
         "phash": phash,
@@ -1298,6 +2511,7 @@ def add_item(paths: Paths, index: dict, item: dict, source: str, target: int, fo
     }
     index["duplicates"].pop(image_id, None)
     save_index(paths, index)
+    mirror_index_to_db(paths, index)
     print(f"已加入 {final.name}")
     return True
 
@@ -1393,6 +2607,9 @@ def cmd_record(paths: Paths, _args: argparse.Namespace) -> int:
     except (OSError, UnicodeError) as exc:
         # A hook must never fail the wallpaper change; log and move on.
         warn(f"history 写入失败：{exc}")
+    if in_pool and image_id:
+        # The DB is best-effort too; db_record_display swallows sqlite errors.
+        db_record_display(paths, image_id, connector, str(path))
     return 0
 
 
@@ -1462,6 +2679,24 @@ def cmd_report(paths: Paths, _args: argparse.Namespace) -> int:
     print("来源      " + "  ".join(f"{source}:{count}" for source, count in sources) + suffix)
     buckets = hue_buckets(index)
     print("色相      " + " ".join(f"{i * 30:3d}°:{count:2d}" for i, count in enumerate(buckets)))
+    library = db_counts(paths)
+    trash = trash_files(paths)
+    trash_bytes = 0
+    for path in trash:
+        try:
+            trash_bytes += path.stat().st_size
+        except OSError:
+            pass
+    print(
+        f"库        已淘汰 {library.get('evicted', 0)} 张    "
+        f"pin {library.get('pinned', 0)} 张    今日淘汰 {db_evicted_today(paths)} 张"
+    )
+    print(f"回收站    {len(trash)} 个文件 / {format_bytes(trash_bytes)}")
+    for row in db_recent_evictions(paths, 5):
+        print(
+            f"  最近淘汰 {row.get('evicted_at') or '?'}  {row.get('id')}  "
+            f"展示 {row.get('shown_count', 0)} 次  收藏 {row.get('favorites') or 0}"
+        )
     if index.get("quarantine"):
         print(f"隔离区    {len(index['quarantine'])} 张（{paths.quarantine}）")
     if index["duplicates"]:
@@ -1571,6 +2806,7 @@ def cmd_dedupe(paths: Paths, args: argparse.Namespace) -> int:
                 except OSError as rollback:
                     warn(f"回滚文件失败：{rollback}")
                 raise SystemExit(1) from exc
+            db_set_status(paths, image_id, "active")
             print(f"已恢复 {image_id} -> {destination}")
             return 0
 
@@ -1611,6 +2847,7 @@ def cmd_dedupe(paths: Paths, args: argparse.Namespace) -> int:
 
         moved = 0
         if args.apply:
+            current = current_wallpaper_ids() or set()
             quarantined = set(index.get("quarantine", {}))
             for distance, left, right in definite:
                 if left in quarantined or right in quarantined:
@@ -1629,7 +2866,12 @@ def cmd_dedupe(paths: Paths, args: argparse.Namespace) -> int:
                 if not left_exists and not right_exists:
                     warn(f"{left}/{right} 的文件都不存在，跳过")
                     continue
-                if left_exists != right_exists:
+                if left in current or right in current:
+                    if left in current and right in current:
+                        warn(f"{left}/{right} 都在显示，跳过")
+                        continue
+                    keep, drop = (left, right) if left in current else (right, left)
+                elif left_exists != right_exists:
                     # Never quarantine the only surviving file.
                     keep, drop = (left, right) if left_exists else (right, left)
                 else:
@@ -1679,6 +2921,13 @@ def cmd_dedupe(paths: Paths, args: argparse.Namespace) -> int:
                     except OSError as rollback:
                         warn(f"回滚文件失败：{rollback}")
                     continue
+                db_set_status(
+                    paths,
+                    drop,
+                    "quarantine",
+                    reason=f"pHash {distance} of {keep}",
+                    trash_path=str(destination),
+                )
                 quarantined.add(drop)
                 moved += 1
                 print(f"  隔离 {drop}（保留 {keep}）-> {destination}")
@@ -1701,6 +2950,30 @@ def warn(message: str) -> None:
     print(f"warning: {message}", file=sys.stderr, flush=True)
 
 
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+def add_source_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--tags",
+        default=",".join(SOURCE_TAGS),
+        help="逗号分隔的标签检索（默认八类题材）",
+    )
+    parser.add_argument("--no-tags", action="store_true", help="不按标签检索")
+    parser.add_argument(
+        "--include-latest",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="包含 Latest（需要收藏数/浏览数门槛）",
+    )
+    parser.add_argument("--min-favorites", type=int, default=0, help="候选最低收藏数")
+    parser.add_argument("--min-views", type=int, default=0, help="候选最低浏览数")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="wallhaven-sync", description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1709,11 +2982,51 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--target", type=int, default=_target_default(), help="目标张数（默认 365）")
     sync.add_argument("--dry-run", action="store_true", help="只列出候选，不下载")
     sync.add_argument("--limit", type=int, default=20, help="dry-run 时最多列出多少个候选")
-    sync.add_argument("--max-pages", type=int, default=None, help="每个榜单最多翻多少页")
+    sync.add_argument("--max-pages", type=int, default=None, help="每个来源最多翻多少页")
+    sync.add_argument("--page-offset", type=int, default=0, help="每个来源跳过前 N 页（默认 0）")
     sync.add_argument("--retry-rejected", action="store_true", help="清空拒绝记录后重新评估")
     sync.add_argument("--retry-duplicates", action="store_true", help="清空重复记录后重新评估")
     sync.add_argument("--force-prune", action="store_true", help="池子大量文件缺失时仍继续（危险）")
+    add_source_args(sync)
     sync.set_defaults(func=cmd_sync)
+
+    replenish = sub.add_parser("replenish", help="每日滚动窗口：淘汰旧图 + 补新图")
+    replenish.add_argument("--target", type=int, default=_target_default(), help="目标张数（默认 365）")
+    replenish.add_argument(
+        "--max-per-day",
+        type=int,
+        default=_int_env("WALLHAVEN_MAX_PER_DAY", DEFAULT_MAX_PER_DAY),
+        help="每天最多淘汰多少张（默认 24）",
+    )
+    replenish.add_argument(
+        "--keep-trash-days",
+        type=int,
+        default=_int_env("WALLHAVEN_TRASH_DAYS", DEFAULT_TRASH_DAYS),
+        help="回收站保留天数（默认 7）",
+    )
+    replenish.add_argument(
+        "--protect-recent-hours",
+        type=float,
+        default=2.0,
+        help="最近多少小时内展示过的图不淘汰（默认 2）",
+    )
+    replenish.add_argument(
+        "--evict-unshown",
+        action="store_true",
+        help="允许淘汰从未展示过的图（默认不允许）",
+    )
+    replenish.add_argument("--force", action="store_true", help="无法确认当前壁纸时仍淘汰（危险）")
+    replenish.add_argument("--dry-run", action="store_true", help="只看计划，不移动/下载")
+    replenish.add_argument("--limit", type=int, default=10, help="dry-run 时最多列出多少候选")
+    replenish.add_argument("--max-pages", type=int, default=2, help="每个来源最多翻多少页")
+    replenish.add_argument(
+        "--page-offset",
+        type=int,
+        default=-1,
+        help="每个来源跳过前 N 页；-1 按日期轮换（默认）",
+    )
+    add_source_args(replenish)
+    replenish.set_defaults(func=cmd_replenish)
 
     status = sub.add_parser("status", help="查看池子与轮换进度")
     status.add_argument("--json", action="store_true")
@@ -1722,10 +3035,47 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="自检 key / 池子 / Noctalia / Umbriel")
     doctor.set_defaults(func=cmd_doctor)
 
+    backfill = sub.add_parser("backfill", help="回填旧索引缺少的 URL/收藏数/标签")
+    backfill.add_argument("--limit", type=int, default=0, help="最多处理多少张（0 = 全部）")
+    backfill.add_argument("--force", action="store_true", help="已有字段也重新拉取")
+    backfill.add_argument("--dry-run", action="store_true")
+    backfill.set_defaults(func=cmd_backfill)
+
     ban = sub.add_parser("ban", help="拉黑并删除一张壁纸")
     ban.add_argument("id")
     ban.add_argument("--reason", default=None)
+    ban.add_argument("--force", action="store_true", help="即使正在显示也删除")
     ban.set_defaults(func=cmd_ban)
+
+    pin = sub.add_parser("pin", help="保护一张图，永不自动淘汰")
+    pin.add_argument("id")
+    pin.set_defaults(func=cmd_pin)
+
+    unpin = sub.add_parser("unpin", help="取消 pin")
+    unpin.add_argument("id")
+    unpin.set_defaults(func=cmd_unpin)
+
+    pins = sub.add_parser("pins", help="列出 pin 的图")
+    pins.set_defaults(func=cmd_pins)
+
+    restore = sub.add_parser("restore", help="从回收站或 Wallhaven 恢复一张已淘汰的图")
+    restore.add_argument("id")
+    restore.add_argument("--target", type=int, default=_target_default())
+    restore.set_defaults(func=cmd_restore)
+
+    trash = sub.add_parser("trash", help="查看或清理淘汰回收站")
+    trash.add_argument("--list", action="store_true", help="列出文件（默认行为）")
+    trash.add_argument("--purge", action="store_true", help="按天数清理")
+    trash.add_argument("--days", type=int, default=_int_env("WALLHAVEN_TRASH_DAYS", DEFAULT_TRASH_DAYS))
+    trash.add_argument("--dry-run", action="store_true")
+    trash.set_defaults(func=cmd_trash)
+
+    checkpoint = sub.add_parser("db-checkpoint", help="合并 library.db 的 WAL（备份前用）")
+    checkpoint.set_defaults(func=cmd_db_checkpoint)
+
+    collections = sub.add_parser("collections", help="把 Wallhaven 收藏夹里的图标记为 pin（只读）")
+    collections.add_argument("--username", default=None, help="Wallhaven 用户名（API 不返回）")
+    collections.set_defaults(func=cmd_collections)
 
     add = sub.add_parser("add", help="手动加入一张壁纸")
     add.add_argument("id_or_url")

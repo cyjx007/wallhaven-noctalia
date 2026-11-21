@@ -258,5 +258,302 @@ class HelpersTest(unittest.TestCase):
         self.assertIsNone(ws.api_reject_reason({"purity": "sfw", "category": "general", "file_size": 1024}))
 
 
+class MetadataTest(unittest.TestCase):
+    def test_entry_metadata_keeps_api_fields(self):
+        item = {
+            "id": "abc123",
+            "url": "https://wallhaven.cc/w/abc123",
+            "dimension_x": 3840,
+            "dimension_y": 2160,
+            "resolution": "3840x2160",
+            "file_type": "image/jpeg",
+            "favorites": 420,
+            "views": 12000,
+            "category": "general",
+            "purity": "sfw",
+            "created_at": "2026-01-01 00:00:00",
+            "thumbs": {"large": "https://th/lg.jpg"},
+        }
+        meta = ws.entry_metadata(item, "tag:city:3M:p2")
+        self.assertEqual(meta["theme"], "city")
+        self.assertEqual(meta["width"], 3840)
+        self.assertEqual(meta["thumb_url"], "https://th/lg.jpg")
+        self.assertEqual(meta["favorites"], 420)
+        self.assertEqual(ws.theme_for_source("latest:p1"), "latest")
+        self.assertEqual(ws.theme_for_source("toplist:1M:p1"), "toplist")
+        self.assertEqual(ws.theme_for_source("restored"), "restored")
+
+
+class SourceTest(unittest.TestCase):
+    def _args(self, **overrides):
+        values = {
+            "tags": "landscape,city",
+            "no_tags": False,
+            "include_latest": True,
+            "min_favorites": 5,
+            "min_views": 10,
+        }
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def test_sources_cover_ranges_tags_and_latest(self):
+        sources = ws.build_sources(self._args())
+        labels = {source["label"] for source in sources}
+        self.assertIn("toplist:1M", labels)
+        self.assertIn("toplist:1y", labels)
+        self.assertIn("tag:landscape:3M", labels)
+        self.assertIn("tag:city:6M", labels)
+        self.assertIn("latest", labels)
+        self.assertEqual(len(sources), 4 * (1 + 2) + 1)
+        for source in sources:
+            self.assertEqual(source["params"]["categories"], "100")
+            self.assertEqual(source["params"]["purity"], "100")
+        latest = next(source for source in sources if source["label"] == "latest")
+        self.assertEqual(latest["min_favorites"], ws.LATEST_MIN_FAVORITES)
+        self.assertEqual(latest["min_views"], ws.LATEST_MIN_VIEWS)
+
+    def test_no_tags(self):
+        labels = {source["label"] for source in ws.build_sources(self._args(no_tags=True))}
+        self.assertFalse(any(label.startswith("tag:") for label in labels))
+
+    def test_page_offset_and_page_cap(self):
+        calls = []
+
+        def fake_api(_key, _endpoint, params):
+            calls.append(params)
+            return {"data": [], "meta": {"last_page": 10}}
+
+        sources = [
+            {
+                "label": "toplist:1M",
+                "params": {},
+                "min_favorites": 0,
+                "min_views": 0,
+            }
+        ]
+        with mock.patch.object(ws, "api_get", side_effect=fake_api):
+            list(ws.iter_candidates("key", max_pages=2, sources=sources, page_offset=3))
+        self.assertEqual([call["page"] for call in calls], ["4", "5"])
+
+
+class DatabaseTest(unittest.TestCase):
+    def _paths(self, tmp):
+        pool = Path(tmp) / "pool"
+        pool.mkdir()
+        return ws.Paths(pool=pool, state=Path(tmp) / "state", key_file=Path(tmp) / "key")
+
+    def _entry(self, name="wallhaven-abc123.jpg", phash="0" * 15 + "1"):
+        return {
+            "file": name,
+            "source": "toplist:1M:p1",
+            "theme": "toplist",
+            "width": 1920,
+            "height": 1080,
+            "resolution": "1920x1080",
+            "bytes": 1000,
+            "sha256": "a" * 64,
+            "phash": phash,
+            "stats": {"luma": 0.3, "stddev": 0.2, "sat": 0.4},
+            "palette": {"primary": "#336699", "hue": 210, "chroma": 40},
+            "favorites": 10,
+            "views": 1000,
+            "category": "general",
+            "purity": "sfw",
+            "url": "https://wallhaven.cc/w/abc123",
+            "thumb_url": "https://th/lg.jpg",
+            "added_at": ws.now(),
+        }
+
+    def test_mirror_and_record_display(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(tmp)
+            index = ws.new_index()
+            index["images"]["abc123"] = self._entry()
+            ws.mirror_index_to_db(paths, index)
+
+            row = ws.db_get(paths, "abc123")
+            self.assertEqual(row["status"], "active")
+            self.assertEqual(row["primary_color"], "#336699")
+            self.assertEqual(row["favorites"], 10)
+
+            ws.db_record_display(paths, "abc123", "eDP-1", str(paths.pool / "wallhaven-abc123.jpg"))
+            row = ws.db_get(paths, "abc123")
+            self.assertEqual(row["shown_count"], 1)
+            self.assertIsNotNone(row["first_shown_at"])
+            # A repeated apply of the same path must not inflate shown_count.
+            ws.db_record_display(paths, "abc123", "eDP-1", str(paths.pool / "wallhaven-abc123.jpg"))
+            row = ws.db_get(paths, "abc123")
+            self.assertEqual(row["shown_count"], 1)
+            with ws.open_db(paths) as conn:
+                events = conn.execute("SELECT COUNT(*) FROM display_history").fetchone()[0]
+            self.assertEqual(events, 2)
+
+    def test_evicted_rows_become_blockers_and_can_revive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(tmp)
+            index = ws.new_index()
+            index["images"]["abc123"] = self._entry()
+            ws.mirror_index_to_db(paths, index)
+            ws.db_set_status(paths, "abc123", "evicted", reason="rotation", trash_path="/tmp/x")
+            ids, phashes, shas = ws.db_blockers(paths)
+            self.assertIn("abc123", ids)
+            self.assertEqual(phashes["abc123"], "0" * 15 + "1")
+            self.assertEqual(shas["a" * 64], "abc123")
+            self.assertEqual(ws.db_counts(paths)["evicted"], 1)
+
+            # Re-adding to the index clears the eviction fields.
+            ws.mirror_index_to_db(paths, index)
+            row = ws.db_get(paths, "abc123")
+            self.assertEqual(row["status"], "active")
+            self.assertIsNone(row["evicted_at"])
+            self.assertIsNone(row["trash_path"])
+
+    def test_evicted_today_only_counts_rotation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(tmp)
+            index = ws.new_index()
+            index["images"]["abc123"] = self._entry()
+            ws.mirror_index_to_db(paths, index)
+            today = ws.datetime.now(ws.timezone.utc).strftime("%Y-%m-%d")
+            with ws.open_db(paths) as conn:
+                conn.execute(
+                    "UPDATE images SET status='evicted', evicted_at=?, evicted_reason='rotation' WHERE id='abc123'",
+                    (f"{today}T01:02:03+00:00",),
+                )
+                conn.commit()
+            self.assertEqual(ws.db_evicted_today(paths), 1)
+            with ws.open_db(paths) as conn:
+                conn.execute("UPDATE images SET evicted_reason='missing' WHERE id='abc123'")
+                conn.commit()
+            self.assertEqual(ws.db_evicted_today(paths), 0)
+
+
+class VictimTest(unittest.TestCase):
+    def _setup(self, tmp):
+        pool = Path(tmp) / "pool"
+        pool.mkdir()
+        paths = ws.Paths(pool=pool, state=Path(tmp) / "state", key_file=Path(tmp) / "key")
+        index = ws.new_index()
+        for image_id in ("a1", "a2", "a3", "a4", "a5"):
+            entry = {
+                "file": f"wallhaven-{image_id}.jpg",
+                "added_at": "2026-01-01T00:00:00+00:00",
+                "stats": {},
+                "palette": {},
+            }
+            (pool / entry["file"]).write_bytes(b"x")
+            index["images"][image_id] = entry
+        ws.mirror_index_to_db(paths, index)
+        with ws.open_db(paths) as conn:
+            conn.execute("UPDATE images SET last_shown_at='2026-11-11T00:00:00+00:00' WHERE id='a1'")
+            conn.execute("UPDATE images SET last_shown_at='2026-11-16T00:00:00+00:00' WHERE id='a2'")
+            conn.execute("UPDATE images SET last_shown_at='2026-11-20T23:59:00+00:00', pinned=1 WHERE id='a4'")
+            conn.execute("UPDATE images SET last_shown_at='2026-10-01T00:00:00+00:00' WHERE id='a5'")
+            conn.commit()
+        return paths, index
+
+    def test_oldest_shown_first_and_protections(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths, index = self._setup(tmp)
+            victims = ws.select_victims(
+                paths, index, 5, protect={"a5"}, protect_recent_hours=2
+            )
+            # a3 was never shown, a4 is pinned, a5 is on screen.
+            self.assertEqual(victims, ["a1", "a2"])
+
+    def test_unshown_only_when_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths, index = self._setup(tmp)
+            victims = ws.select_victims(
+                paths,
+                index,
+                5,
+                protect=set(),
+                include_unshown=True,
+                protect_recent_hours=0,
+            )
+            self.assertEqual(victims[0], "a5")  # oldest shown first
+            self.assertIn("a3", victims)  # unseen allowed
+            self.assertNotIn("a4", victims)  # pinned
+            self.assertIn("a1", victims)
+
+
+class TrashTest(unittest.TestCase):
+    def _paths(self, tmp):
+        pool = Path(tmp) / "pool"
+        pool.mkdir()
+        return ws.Paths(pool=pool, state=Path(tmp) / "state", key_file=Path(tmp) / "key")
+
+    def test_purge_keeps_recent_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(tmp)
+            month = paths.trash / "202611"
+            month.mkdir(parents=True)
+            old = month / "old.jpg"
+            new = month / "new.jpg"
+            old.write_bytes(b"old")
+            new.write_bytes(b"new")
+            past = ws.time.time() - 9 * 86400
+            os.utime(old, (past, past))
+            removed = ws.purge_trash(paths, 7)
+            self.assertEqual(removed, [old])
+            self.assertFalse(old.exists())
+            self.assertTrue(new.exists())
+
+    def test_evict_moves_to_trash_and_restore_brings_it_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(tmp)
+            index = ws.new_index()
+            index["images"]["abc123"] = {
+                "file": "wallhaven-abc123.jpg",
+                "source": "toplist:1M:p1",
+                "theme": "toplist",
+                "added_at": ws.now(),
+                "bytes": 1,
+                "sha256": "b" * 64,
+                "phash": "0" * 15 + "2",
+                "stats": {"luma": 0.3, "stddev": 0.2, "sat": 0.4},
+                "palette": {"primary": "#336699", "hue": 210, "chroma": 40},
+            }
+            (paths.pool / "wallhaven-abc123.jpg").write_bytes(b"x")
+            ws.save_index(paths, index)
+            ws.mirror_index_to_db(paths, index)
+
+            args = argparse.Namespace(dry_run=False)
+            evicted = ws.evict_batch(paths, index, ["abc123"], args)
+            self.assertEqual(evicted, ["abc123"])
+            self.assertFalse((paths.pool / "wallhaven-abc123.jpg").exists())
+            row = ws.db_get(paths, "abc123")
+            self.assertEqual(row["status"], "evicted")
+            self.assertTrue(Path(row["trash_path"]).exists())
+
+            ws.cmd_restore(paths, argparse.Namespace(id="abc123", target=365))
+            self.assertTrue((paths.pool / "wallhaven-abc123.jpg").exists())
+            self.assertEqual(ws.db_get(paths, "abc123")["status"], "active")
+            self.assertIn("abc123", ws.load_index(paths)["images"])
+
+
+class AddArchivedTest(unittest.TestCase):
+    def test_add_refuses_archived_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = Path(tmp) / "pool"
+            pool.mkdir()
+            paths = ws.Paths(pool=pool, state=Path(tmp) / "state", key_file=Path(tmp) / "key")
+            with ws.open_db(paths) as conn:
+                conn.execute(
+                    "INSERT INTO images (id, status, phash) VALUES ('abc123', 'evicted', ?)",
+                    ("0" * 15 + "3",),
+                )
+                conn.commit()
+            result = ws.add_item(
+                paths,
+                ws.new_index(),
+                {"id": "abc123", "purity": "sfw", "category": "general"},
+                "manual",
+                365,
+            )
+            self.assertFalse(result)
+
+
 if __name__ == "__main__":
     unittest.main()
