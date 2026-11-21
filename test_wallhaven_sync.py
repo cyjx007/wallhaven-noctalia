@@ -397,6 +397,14 @@ class HelpersTest(unittest.TestCase):
         self.assertGreater(third, first)
         self.assertGreaterEqual(ws.retry_delay(1, 120), 120)
 
+    def test_parse_bytes(self):
+        self.assertEqual(ws.parse_bytes("512M"), 512 * 1024**2)
+        self.assertEqual(ws.parse_bytes("1.5GiB"), int(1.5 * 1024**3))
+        self.assertEqual(ws.parse_bytes("3G"), 3 * 1024**3)
+        self.assertEqual(ws.parse_bytes("3221225472"), 3 * 1024**3)
+        with self.assertRaises(argparse.ArgumentTypeError):
+            ws.parse_bytes("3X")
+
     def test_api_reject_reason(self):
         self.assertEqual(ws.api_reject_reason({"purity": "nsfw"}), "not-sfw")
         self.assertEqual(ws.api_reject_reason({"purity": "sfw", "category": "anime"}), "not-general")

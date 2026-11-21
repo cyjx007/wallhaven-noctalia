@@ -2066,6 +2066,18 @@ def cmd_restore(paths: Paths, args: argparse.Namespace) -> int:
             return 0
         source = Path(row["trash_path"]) if row and row.get("trash_path") else None
         if source and source.exists():
+            max_bytes = int(getattr(args, "max_bytes", 0) or 0)
+            force = bool(getattr(args, "force", False))
+            try:
+                restore_bytes = source.stat().st_size
+            except OSError:
+                restore_bytes = 0
+            _, used = pool_usage(paths.pool)
+            if max_bytes and not force and used + restore_bytes > max_bytes:
+                raise SystemExit(
+                    f"恢复会超过容量上限（{format_bytes(used)} + {format_bytes(restore_bytes)} "
+                    f"> {format_bytes(max_bytes)}）；加 --force 强制恢复"
+                )
             paths.pool.mkdir(parents=True, exist_ok=True)
             destination = paths.pool / (row.get("file") or source.name)
             try:
@@ -2085,7 +2097,14 @@ def cmd_restore(paths: Paths, args: argparse.Namespace) -> int:
         key = read_key(paths)
         item = fetch_item(key, image_id)
         if not add_item(
-            paths, index, item, "restored", args.target, force=True, allow_archived=True
+            paths,
+            index,
+            item,
+            "restored",
+            args.target,
+            force=True,
+            allow_archived=True,
+            max_bytes=0 if getattr(args, "force", False) else getattr(args, "max_bytes", 0),
         ):
             raise SystemExit(f"重新下载 {image_id} 失败")
         db_set_status(paths, image_id, "active")
@@ -2456,6 +2475,15 @@ def cmd_doctor(paths: Paths, _args: argparse.Namespace) -> int:
         ok(f"回收站 {len(files)} 个文件 / {format_bytes(size)}（{paths.trash}）")
     else:
         ok("回收站还不存在（还没有淘汰过）")
+    count, used = pool_usage(paths.pool)
+    max_bytes = _int_env("WALLHAVEN_MAX_BYTES", DEFAULT_MAX_BYTES)
+    if max_bytes and used > max_bytes:
+        warn_check(
+            f"池子超过容量上限（{format_bytes(used)} / {format_bytes(max_bytes)}，"
+            f"{count} 张）；跑一次 replenish 或调大 maxBytes"
+        )
+    else:
+        ok(f"容量 {format_bytes(used)} / {format_bytes(max_bytes)}（{count} 张）")
     if shutil.which("noctalia"):
         try:
             hooks = run(["noctalia", "msg", "config-get", "hooks"], timeout=20)
@@ -3211,6 +3239,31 @@ def warn(message: str) -> None:
     print(f"warning: {message}", file=sys.stderr, flush=True)
 
 
+def parse_bytes(value: str) -> int:
+    """argparse type for values like 512M, 1.5GiB, 3G, 3221225472."""
+    text = value.strip().lower().replace(" ", "")
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([kmgt]?i?b?)", text)
+    if not match:
+        raise argparse.ArgumentTypeError(f"无法解析容量：{value}（示例：512M、3G、1.5GiB）")
+    factors = {
+        "": 1,
+        "b": 1,
+        "k": 1024,
+        "kb": 1024,
+        "kib": 1024,
+        "m": 1024**2,
+        "mb": 1024**2,
+        "mib": 1024**2,
+        "g": 1024**3,
+        "gb": 1024**3,
+        "gib": 1024**3,
+        "t": 1024**4,
+        "tb": 1024**4,
+        "tib": 1024**4,
+    }
+    return int(float(match.group(1)) * factors[match.group(2)])
+
+
 def _int_env(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, default))
@@ -3247,7 +3300,7 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--page-offset", type=int, default=0, help="每个来源跳过前 N 页（默认 0）")
     sync.add_argument(
         "--max-bytes",
-        type=int,
+        type=parse_bytes,
         default=_int_env("WALLHAVEN_MAX_BYTES", DEFAULT_MAX_BYTES),
         help=f"池子字节上限（默认 {DEFAULT_MAX_BYTES // 1024**3} GiB，0 = 不限制）",
     )
@@ -3294,7 +3347,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     replenish.add_argument(
         "--max-bytes",
-        type=int,
+        type=parse_bytes,
         default=_int_env("WALLHAVEN_MAX_BYTES", DEFAULT_MAX_BYTES),
         help=f"池子字节硬上限（默认 {DEFAULT_MAX_BYTES // 1024**3} GiB，0 = 不限制）",
     )
@@ -3334,6 +3387,13 @@ def build_parser() -> argparse.ArgumentParser:
     restore = sub.add_parser("restore", help="从回收站或 Wallhaven 恢复一张已淘汰的图")
     restore.add_argument("id")
     restore.add_argument("--target", type=int, default=_target_default())
+    restore.add_argument(
+        "--max-bytes",
+        type=parse_bytes,
+        default=_int_env("WALLHAVEN_MAX_BYTES", DEFAULT_MAX_BYTES),
+        help="容量上限；超限时拒绝恢复",
+    )
+    restore.add_argument("--force", action="store_true", help="超过容量也恢复")
     restore.set_defaults(func=cmd_restore)
 
     trash = sub.add_parser("trash", help="查看或清理淘汰回收站")
@@ -3356,7 +3416,7 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--force", action="store_true", help="跳过品控强制加入")
     add.add_argument(
         "--max-bytes",
-        type=int,
+        type=parse_bytes,
         default=_int_env("WALLHAVEN_MAX_BYTES", DEFAULT_MAX_BYTES),
         help="池子字节上限（0 = 不限制）",
     )
