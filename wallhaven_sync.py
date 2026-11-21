@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import colorsys
+from collections import Counter
 import contextlib
 import fcntl
 import hashlib
@@ -65,6 +66,12 @@ MUTED_SHARE = 0.10
 HUE_CAP_FACTOR = 1.5
 SOFT_REASONS = frozenset({"hue-quota", "muted-quota"})
 
+# pHash: 16x16 DCT, top-left 8x8, median threshold (64-bit fingerprint).
+PHASH_SIZE = 16
+PHASH_LOW = 8
+PHASH_AUTO_DUPLICATE = 3
+PHASH_SUSPECT = 7
+
 
 # --------------------------------------------------------------------------- #
 # paths / index
@@ -103,6 +110,14 @@ class Paths:
     def lock(self) -> Path:
         return self.state / "lock"
 
+    @property
+    def history(self) -> Path:
+        return self.state / "history.jsonl"
+
+    @property
+    def quarantine(self) -> Path:
+        return self.pool.parent / f"{self.pool.name}-quarantine" / "duplicates"
+
 
 def now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -111,11 +126,13 @@ def now() -> str:
 def new_index() -> dict:
     return {
         "version": 1,
+        "phash_version": 1,
         "updated_at": None,
         "images": {},
         "rejected": {},
         "duplicates": {},
         "banned": {},
+        "quarantine": {},
     }
 
 
@@ -300,6 +317,90 @@ def image_stats(path: Path) -> dict:
     }
 
 
+def _dct_matrix(size: int) -> list[list[float]]:
+    return [
+        [
+            (math.sqrt(1 / size) if u == 0 else math.sqrt(2 / size))
+            * math.cos((2 * x + 1) * u * math.pi / (2 * size))
+            for x in range(size)
+        ]
+        for u in range(size)
+    ]
+
+
+_DCT = _dct_matrix(PHASH_SIZE)
+
+
+def phash_from_gray(data: bytes) -> str | None:
+    """16x16 grayscale bytes -> 64-bit fingerprint.
+
+    This is a 16x16 variant of pHash (top-left 8x8 DCT, DC included, upper
+    median + strict greater-than).  Thresholds 3/7 are calibrated for this
+    variant, not for the classic 32x32 imagehash implementation.
+    """
+    size = PHASH_SIZE
+    if len(data) != size * size:
+        return None
+    rows = [list(data[i * size : (i + 1) * size]) for i in range(size)]
+    # Separable 2D DCT: rows then columns.
+    tmp = [
+        [sum(_DCT[u][x] * rows[x][y] for x in range(size)) for y in range(size)]
+        for u in range(size)
+    ]
+    coef = [
+        [sum(tmp[u][v] * _DCT[w][v] for v in range(size)) for w in range(size)]
+        for u in range(size)
+    ]
+    low = [coef[y][x] for y in range(PHASH_LOW) for x in range(PHASH_LOW)]
+    median = sorted(low)[len(low) // 2]
+    bits = 0
+    for index, value in enumerate(low):
+        if value > median:
+            bits |= 1 << index
+    return f"{bits:016x}"
+
+
+def image_phash(path: Path) -> str | None:
+    magick = shutil.which("magick")
+    if not magick:
+        raise RuntimeError("找不到 ImageMagick（magick）")
+    result = subprocess.run(
+        [
+            magick,
+            f"{path}[0]",
+            "-resize",
+            f"{PHASH_SIZE}x{PHASH_SIZE}!",
+            "-colorspace",
+            "Gray",
+            "-depth",
+            "8",
+            "gray:-",
+        ],
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode("utf-8", "replace").strip())
+    return phash_from_gray(result.stdout)
+
+
+def phash_distance(left: str, right: str) -> int:
+    return (int(left, 16) ^ int(right, 16)).bit_count()
+
+
+def find_phash_pairs(hashes: dict[str, str], threshold: int) -> list[tuple[int, str, str]]:
+    items = sorted(hashes.items())
+    pairs: list[tuple[int, str, str]] = []
+    for index, (left_id, left_hash) in enumerate(items):
+        for right_id, right_hash in items[index + 1 :]:
+            distance = phash_distance(left_hash, right_hash)
+            if distance <= threshold:
+                pairs.append((distance, left_id, right_id))
+    pairs.sort()
+    return pairs
+
+
 def hex_to_rgb(value: str) -> tuple[int, int, int]:
     value = value.lstrip("#")
     return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
@@ -465,6 +566,16 @@ def prune_missing(paths: Paths, index: dict) -> list[str]:
     return missing
 
 
+def blocked_duplicates(index: dict) -> set[str]:
+    """Duplicate IDs are only skipped while their original is still in the pool."""
+    images = index["images"]
+    return {
+        image_id
+        for image_id, entry in index["duplicates"].items()
+        if entry.get("of") in images
+    }
+
+
 def sync_locked(paths: Paths, args: argparse.Namespace) -> int:
     index = load_index(paths)
     target = args.target
@@ -479,6 +590,12 @@ def sync_locked(paths: Paths, args: argparse.Namespace) -> int:
     if args.retry_rejected and index["rejected"]:
         print(f"清除 {len(index['rejected'])} 条拒绝记录，本次会重新评估。", flush=True)
         index["rejected"].clear()
+        if not dry_run:
+            save_index(paths, index)
+
+    if args.retry_duplicates and index["duplicates"]:
+        print(f"清除 {len(index['duplicates'])} 条重复记录，本次会重新评估。", flush=True)
+        index["duplicates"].clear()
         if not dry_run:
             save_index(paths, index)
 
@@ -516,6 +633,12 @@ def sync_locked(paths: Paths, args: argparse.Namespace) -> int:
         for image_id, entry in index["images"].items()
         if entry.get("sha256")
     }
+    phashes = {
+        image_id: entry["phash"]
+        for image_id, entry in index["images"].items()
+        if entry.get("phash")
+    }
+    dup_blocked = blocked_duplicates(index)
     accepted = 0
     considered = 0
     deferred = 0
@@ -535,7 +658,13 @@ def sync_locked(paths: Paths, args: argparse.Namespace) -> int:
             image_id = item.get("id")
             if not image_id:
                 continue
-            if image_id in index["images"] or image_id in index["banned"] or image_id in index["rejected"]:
+            if (
+                image_id in index["images"]
+                or image_id in index["banned"]
+                or image_id in index["rejected"]
+                or image_id in dup_blocked
+                or image_id in index.get("quarantine", {})
+            ):
                 continue
 
             considered += 1
@@ -589,6 +718,32 @@ def sync_locked(paths: Paths, args: argparse.Namespace) -> int:
                 warn(f"{image_id} 无法解析：{exc}")
                 continue
 
+            try:
+                phash = image_phash(temporary)
+            except RuntimeError as exc:
+                warn(f"{image_id} pHash 失败：{exc}")
+                phash = None
+            if phash:
+                near_duplicate = None
+                near_distance = None
+                for existing_id, existing_hash in phashes.items():
+                    distance = phash_distance(phash, existing_hash)
+                    if distance <= PHASH_AUTO_DUPLICATE and (
+                        near_distance is None or distance < near_distance
+                    ):
+                        near_duplicate = existing_id
+                        near_distance = distance
+                if near_duplicate:
+                    temporary.unlink(missing_ok=True)
+                    index["duplicates"][image_id] = {
+                        "of": near_duplicate,
+                        "distance": near_distance,
+                        "at": now(),
+                        "phash": phash,
+                    }
+                    save_index(paths, index)
+                    continue
+
             reason = judge(stats, palette, index, target, relaxed=relaxed)
             if reason:
                 temporary.unlink(missing_ok=True)
@@ -608,10 +763,13 @@ def sync_locked(paths: Paths, args: argparse.Namespace) -> int:
                 "resolution": item.get("resolution"),
                 "bytes": size,
                 "sha256": digest,
+                "phash": phash,
                 "stats": stats,
                 "palette": palette,
             }
             hashes[digest] = image_id
+            if phash:
+                phashes[image_id] = phash
             accepted += 1
             save_index(paths, index)
             palette_text = (
@@ -669,6 +827,48 @@ def format_bytes(size: int) -> str:
     return f"{size:.1f} GiB"
 
 
+def pool_id_from_filename(name: str) -> str | None:
+    match = re.match(r"wallhaven-([a-z0-9]{6})\.[a-z0-9]+$", name, re.IGNORECASE)
+    return match.group(1).lower() if match else None
+
+
+def append_history(paths: Paths, event: dict) -> None:
+    paths.state.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(event, ensure_ascii=True, sort_keys=True) + "\n"
+    with open(paths.history, "a", encoding="utf-8") as handle:
+        # Never block a Noctalia hook on another writer; O_APPEND keeps the
+        # line atomic and flock is only a best-effort serialisation.
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass
+        try:
+            handle.write(line)
+            handle.flush()
+            os.fsync(handle.fileno())
+        finally:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+            except OSError:
+                pass
+
+
+def read_history(paths: Paths) -> list[dict]:
+    try:
+        lines = paths.history.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    events: list[dict] = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
 def shuffle_state_path() -> Path:
     state_home = _xdg("XDG_STATE_HOME", ".local/state")
     return state_home / "noctalia" / "wallpaper_shuffle.json"
@@ -698,7 +898,18 @@ def cmd_status(paths: Paths, args: argparse.Namespace) -> int:
     images = index["images"]
     target = index.get("target") or _target_default()
     files = pool_images(paths.pool)
-    disk = sum(p.stat().st_size for p in files)
+    disk = 0
+    for path in files:
+        try:
+            disk += path.stat().st_size
+        except OSError:
+            pass
+    if images and not files:
+        warn(f"索引有 {len(images)} 张，但池目录 {paths.pool} 没有图片；检查 WALLHAVEN_POOL_DIR")
+    events = read_history(paths)
+    pool_events = [e for e in events if e.get("in_pool") and e.get("id")]
+    shown = {str(e["id"]) for e in pool_events} & set(images)
+    phash_ready = sum(1 for entry in images.values() if entry.get("phash"))
 
     if args.json:
         payload = {
@@ -711,6 +922,10 @@ def cmd_status(paths: Paths, args: argparse.Namespace) -> int:
             "rejected": len(index["rejected"]),
             "duplicates": len(index["duplicates"]),
             "banned": len(index["banned"]),
+            "quarantine": len(index.get("quarantine", {})),
+            "phash": phash_ready,
+            "shown": len(shown),
+            "history_events": len(pool_events),
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
@@ -718,6 +933,8 @@ def cmd_status(paths: Paths, args: argparse.Namespace) -> int:
     print(f"池子      {paths.pool}")
     print(f"数量      {len(images)}/{target} 张（磁盘 {format_bytes(disk)}，文件 {len(files)}）")
     print(f"拒绝      {len(index['rejected'])} 个    重复 {len(index['duplicates'])} 个    拉黑 {len(index['banned'])} 个")
+    print(f"指纹      pHash {phash_ready}/{len(images)} 张    隔离 {len(index.get('quarantine', {}))} 张")
+    print(f"展示      已看过 {len(shown)} 张 / 从未 {max(0, len(images) - len(shown))} 张（历史 {len(pool_events)} 条）")
 
     buckets = hue_buckets(index)
     print("色相分布  " + " ".join(f"{i * 30:3d}°:{count:2d}" for i, count in enumerate(buckets)))
@@ -987,8 +1204,14 @@ def parse_wallpaper_id(raw: str) -> str | None:
 
 def add_item(paths: Paths, index: dict, item: dict, source: str, target: int, force: bool = False) -> bool:
     image_id = item["id"]
-    if image_id in index["images"] or image_id in index["banned"]:
-        print(f"{image_id} 已在池中或被拉黑")
+    duplicate = index["duplicates"].get(image_id)
+    if (
+        image_id in index["images"]
+        or image_id in index["banned"]
+        or (duplicate and duplicate.get("of") in index["images"])
+        or image_id in index.get("quarantine", {})
+    ):
+        print(f"{image_id} 已在池中、被拉黑、重复或隔离")
         return False
     reason = api_reject_reason(item)
     if reason:
@@ -1010,6 +1233,34 @@ def add_item(paths: Paths, index: dict, item: dict, source: str, target: int, fo
             save_index(paths, index)
             print(f"{image_id} 与 {existing_id} 内容相同，跳过")
             return False
+    try:
+        phash = image_phash(temporary)
+    except RuntimeError as exc:
+        print(f"{image_id} pHash 失败：{exc}")
+        phash = None
+    if phash:
+        near_duplicate = None
+        near_distance = None
+        for existing_id, entry in index["images"].items():
+            if not entry.get("phash"):
+                continue
+            distance = phash_distance(phash, entry["phash"])
+            if distance <= PHASH_AUTO_DUPLICATE and (
+                near_distance is None or distance < near_distance
+            ):
+                near_duplicate = existing_id
+                near_distance = distance
+        if near_duplicate:
+            temporary.unlink(missing_ok=True)
+            index["duplicates"][image_id] = {
+                "of": near_duplicate,
+                "distance": near_distance,
+                "at": now(),
+                "phash": phash,
+            }
+            save_index(paths, index)
+            print(f"{image_id} 与 {near_duplicate} 视觉重复（距离 {near_distance}），跳过")
+            return False
     reason = judge(stats, palette, index, target)
     if reason and not force:
         temporary.unlink(missing_ok=True)
@@ -1026,6 +1277,7 @@ def add_item(paths: Paths, index: dict, item: dict, source: str, target: int, fo
         "resolution": item.get("resolution"),
         "bytes": size,
         "sha256": digest,
+        "phash": phash,
         "stats": stats,
         "palette": palette,
     }
@@ -1096,6 +1348,279 @@ def cmd_preview(paths: Paths, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_record(paths: Paths, _args: argparse.Namespace) -> int:
+    raw = os.environ.get("NOCTALIA_WALLPAPER_PATH", "").strip()
+    if not raw:
+        return 0
+    path = Path(raw)
+    connector = os.environ.get("NOCTALIA_WALLPAPER_CONNECTOR", "").strip() or None
+    try:
+        in_pool = path.resolve().parent == paths.pool.resolve()
+    except (OSError, RuntimeError):
+        in_pool = False
+    image_id = pool_id_from_filename(path.name)
+    if not in_pool and image_id:
+        warn(f"history: {path} 不在池 {paths.pool}，按外部壁纸记录")
+    try:
+        append_history(
+            paths,
+            {
+                "at": now(),
+                "path": str(path),
+                "pool": str(paths.pool),
+                "id": image_id,
+                "connector": connector,
+                "in_pool": in_pool,
+                "source": "noctalia",
+            },
+        )
+    except (OSError, UnicodeError) as exc:
+        # A hook must never fail the wallpaper change; log and move on.
+        warn(f"history 写入失败：{exc}")
+    return 0
+
+
+def cmd_history(paths: Paths, args: argparse.Namespace) -> int:
+    events = read_history(paths)
+    selected = events[-args.limit :] if args.limit > 0 else []
+    if args.json:
+        print(json.dumps(selected, ensure_ascii=False, indent=2))
+        return 0
+    if not selected:
+        print("还没有历史记录。确认 Noctalia 的 wallpaper_changed 钩子已启用。")
+        return 0
+    for event in selected:
+        image_id = event.get("id") or "-"
+        connector = event.get("connector") or "-"
+        print(f"{event.get('at', '')}  {image_id:<8}  {connector:<8}  {event.get('path', '')}")
+    return 0
+
+
+def cmd_report(paths: Paths, _args: argparse.Namespace) -> int:
+    index = load_index(paths)
+    events = read_history(paths)
+    raw_events = [e for e in events if e.get("in_pool") and e.get("id")]
+    # Noctalia also fires wallpaper_changed on config reload / repeated apply;
+    # count only consecutive path changes as real displays.
+    pool_events: list[dict] = []
+    previous = None
+    for event in raw_events:
+        key = (event.get("connector"), event.get("path"))
+        if key != previous:
+            pool_events.append(event)
+        previous = key
+    counts = Counter(str(e["id"]) for e in pool_events)
+    shown = set(counts)
+    never = set(index["images"]) - shown
+    files = pool_images(paths.pool)
+    disk = 0
+    for path in files:
+        try:
+            disk += path.stat().st_size
+        except OSError:
+            pass
+    if index["images"] and not files:
+        warn(f"索引有 {len(index['images'])} 张，但池目录 {paths.pool} 没有图片；检查 WALLHAVEN_POOL_DIR")
+    phash_ready = sum(1 for entry in index["images"].values() if entry.get("phash"))
+
+    print(f"池子      {len(index['images'])} 张（磁盘 {format_bytes(disk)}，文件 {len(files)}）")
+    print(f"指纹      pHash {phash_ready}/{len(index['images'])} 张")
+    print(
+        f"展示      已看过 {len(shown)} 张，从未展示 {len(never)} 张，"
+        f"历史事件 {len(pool_events)} 条（原始 {len(raw_events)} 条）"
+    )
+    if pool_events:
+        print(f"最近一次  {pool_events[-1].get('at', '')}  {pool_events[-1].get('id')}  ({pool_events[-1].get('connector') or '-'})")
+    if counts:
+        print("最常展示  " + "  ".join(f"{image_id}:{count}" for image_id, count in counts.most_common(8)))
+    if never:
+        sample = sorted(never)[:8]
+        print(f"未展示样例 {', '.join(sample)}")
+
+    by_source = Counter(entry.get("source", "?") for entry in index["images"].values())
+    print("来源      " + "  ".join(f"{source}:{count}" for source, count in by_source.most_common()))
+    buckets = hue_buckets(index)
+    print("色相      " + " ".join(f"{i * 30:3d}°:{count:2d}" for i, count in enumerate(buckets)))
+    if index.get("quarantine"):
+        print(f"隔离区    {len(index['quarantine'])} 张（{paths.quarantine}）")
+    if index["duplicates"]:
+        print(f"内容重复  {len(index['duplicates'])} 个 ID 被跳过")
+        for image_id, entry in list(index["duplicates"].items())[:8]:
+            print(
+                f"  {image_id} -> {entry.get('of', '?')}"
+                f"（距离 {entry.get('distance', 'SHA256')}）"
+            )
+    return 0
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def build_entry_from_file(path: Path, source: str = "restored") -> dict:
+    try:
+        stats = image_stats(path)
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        stats = {}
+    try:
+        palette = palette_info(path)
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        palette = None
+    try:
+        phash = image_phash(path)
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        phash = None
+    return {
+        "file": path.name,
+        "source": source,
+        "added_at": now(),
+        "resolution": None,
+        "bytes": path.stat().st_size,
+        "sha256": file_sha256(path),
+        "phash": phash,
+        "stats": stats,
+        "palette": palette,
+    }
+
+
+def cmd_dedupe(paths: Paths, args: argparse.Namespace) -> int:
+    if args.auto > args.threshold:
+        raise SystemExit("--auto 不能大于 --threshold")
+
+    with exclusive_lock(paths.lock) as acquired:
+        if not acquired:
+            raise SystemExit("另一个 wallhaven-sync 正在运行")
+        index = load_index(paths)
+
+        if args.list_quarantine:
+            entries = index.get("quarantine", {})
+            if not entries:
+                print("隔离区是空的。")
+                return 0
+            for image_id, entry in sorted(entries.items()):
+                print(
+                    f"{image_id}  file={entry.get('file', '?')}  "
+                    f"of={entry.get('of', '?')}  distance={entry.get('distance', '?')}"
+                )
+            return 0
+
+        if args.restore:
+            image_id = args.restore
+            entry = index.get("quarantine", {}).get(image_id)
+            if not entry:
+                raise SystemExit(f"{image_id} 不在隔离区")
+            source = paths.quarantine / entry["file"]
+            if not source.exists():
+                raise SystemExit(f"隔离文件不存在：{source}")
+            destination = paths.pool / entry["file"]
+            if destination.exists():
+                raise SystemExit(f"池子里已有同名文件：{destination}")
+            paths.pool.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(destination))
+            restored = entry.get("entry") or build_entry_from_file(destination)
+            restored["file"] = destination.name
+            index["images"][image_id] = restored
+            del index["quarantine"][image_id]
+            index["duplicates"].pop(image_id, None)
+            save_index(paths, index)
+            print(f"已恢复 {image_id} -> {destination}")
+            return 0
+
+        computed = 0
+        for image_id, entry in index["images"].items():
+            if entry.get("phash"):
+                continue
+            file = paths.pool / entry["file"]
+            if not file.exists():
+                continue
+            try:
+                phash = image_phash(file)
+            except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+                warn(f"{image_id} pHash 失败：{exc}")
+                continue
+            if phash:
+                entry["phash"] = phash
+                computed += 1
+            else:
+                warn(f"{image_id} pHash 输出长度异常，跳过")
+        hashes = {
+            image_id: entry["phash"]
+            for image_id, entry in index["images"].items()
+            if entry.get("phash")
+        }
+        pairs = find_phash_pairs(hashes, args.threshold)
+        definite = [pair for pair in pairs if pair[0] <= args.auto]
+        suspect = [pair for pair in pairs if args.auto < pair[0] <= args.threshold]
+
+        print(f"计算了 {computed} 个 pHash；距离 ≤{args.threshold} 的共 {len(pairs)} 对")
+        for distance, left, right in definite:
+            print(f"  {distance:2d}  {left}  {right}  -> 重复（--apply 时隔离）")
+        for distance, left, right in suspect:
+            print(f"  {distance:2d}  {left}  {right}  -> 待确认（不自动处理）")
+
+        moved = 0
+        if args.apply:
+            quarantined = set(index.get("quarantine", {}))
+            for distance, left, right in definite:
+                if left in quarantined or right in quarantined:
+                    continue
+                if left not in index["images"] or right not in index["images"]:
+                    continue
+                left_entry = index["images"][left]
+                right_entry = index["images"][right]
+                left_file = paths.pool / left_entry["file"]
+                right_file = paths.pool / right_entry["file"]
+                left_exists = left_file.exists()
+                right_exists = right_file.exists()
+                if not left_exists and not right_exists:
+                    warn(f"{left}/{right} 的文件都不存在，跳过")
+                    continue
+                if left_exists != right_exists:
+                    # Never quarantine the only surviving file.
+                    keep, drop = (left, right) if left_exists else (right, left)
+                else:
+                    keep, drop = (
+                        (left, right)
+                        if int(left_entry.get("bytes") or 0) >= int(right_entry.get("bytes") or 0)
+                        else (right, left)
+                    )
+                source = paths.pool / index["images"][drop]["file"]
+                destination = paths.quarantine / source.name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    if source.stat().st_dev != destination.parent.stat().st_dev:
+                        shutil.move(str(source), str(destination))
+                    else:
+                        os.replace(source, destination)
+                except OSError as exc:
+                    warn(f"移动 {source} 失败：{exc}")
+                    continue
+                index["quarantine"][drop] = {
+                    "file": destination.name,
+                    "of": keep,
+                    "distance": distance,
+                    "at": now(),
+                    "entry": index["images"][drop],
+                }
+                del index["images"][drop]
+                quarantined.add(drop)
+                moved += 1
+                save_index(paths, index)
+                print(f"  隔离 {drop}（保留 {keep}）-> {destination}")
+
+        if args.apply or computed:
+            save_index(paths, index)
+        if args.apply:
+            print(f"完成：隔离 {moved} 张，池子剩 {len(index['images'])} 张")
+        else:
+            print("dry-run：没有移动文件；加 --apply 只隔离距离 ≤%d 的重复" % args.auto)
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
@@ -1115,6 +1640,7 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--limit", type=int, default=20, help="dry-run 时最多列出多少个候选")
     sync.add_argument("--max-pages", type=int, default=None, help="每个榜单最多翻多少页")
     sync.add_argument("--retry-rejected", action="store_true", help="清空拒绝记录后重新评估")
+    sync.add_argument("--retry-duplicates", action="store_true", help="清空重复记录后重新评估")
     sync.set_defaults(func=cmd_sync)
 
     status = sub.add_parser("status", help="查看池子与轮换进度")
@@ -1138,6 +1664,25 @@ def build_parser() -> argparse.ArgumentParser:
     preview = sub.add_parser("preview", help="预览某张壁纸的配色")
     preview.add_argument("path_or_id")
     preview.set_defaults(func=cmd_preview)
+
+    record = sub.add_parser("record", help="记录 Noctalia wallpaper_changed（给钩子用）")
+    record.set_defaults(func=cmd_record)
+
+    history = sub.add_parser("history", help="查看展示历史")
+    history.add_argument("--limit", type=int, default=30)
+    history.add_argument("--json", action="store_true")
+    history.set_defaults(func=cmd_history)
+
+    report = sub.add_parser("report", help="图库统计报告")
+    report.set_defaults(func=cmd_report)
+
+    dedupe = sub.add_parser("dedupe", help="pHash 去重（默认只报告）")
+    dedupe.add_argument("--apply", action="store_true", help="隔离距离 ≤ --auto 的重复")
+    dedupe.add_argument("--threshold", type=int, default=PHASH_SUSPECT, help="报告阈值（默认 7）")
+    dedupe.add_argument("--auto", type=int, default=PHASH_AUTO_DUPLICATE, help="自动隔离阈值（默认 3）")
+    dedupe.add_argument("--list-quarantine", action="store_true", help="列出隔离区并退出")
+    dedupe.add_argument("--restore", metavar="ID", help="把隔离区的一张图移回池子并重建索引")
+    dedupe.set_defaults(func=cmd_dedupe)
 
     return parser
 

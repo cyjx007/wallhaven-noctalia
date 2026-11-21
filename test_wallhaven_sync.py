@@ -3,7 +3,11 @@
 Run: python3 -m unittest discover -s . -p 'test_*.py'
 """
 
+import os
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 import wallhaven_sync as ws
 
@@ -82,6 +86,116 @@ class ParseIdTest(unittest.TestCase):
         self.assertEqual(ws.parse_wallpaper_id("wallhaven-94x34k.jpg"), "94x34k")
         self.assertEqual(ws.parse_wallpaper_id("94x34k"), "94x34k")
         self.assertIsNone(ws.parse_wallpaper_id("https://wallhaven.cc/search?q=x"))
+
+
+class PhashTest(unittest.TestCase):
+    def test_distance_and_pairs(self):
+        a = f"{0:016x}"
+        b = f"{1:016x}"
+        c = f"{2**64 - 1:016x}"
+        self.assertEqual(ws.phash_distance(a, b), 1)
+        pairs = ws.find_phash_pairs({"a": a, "b": b, "c": c}, 4)
+        self.assertIn((1, "a", "b"), pairs)
+        self.assertNotIn((1, "a", "c"), pairs)
+        self.assertEqual(ws.find_phash_pairs({"a": a, "b": b}, 0), [])
+
+    def test_phash_from_gray(self):
+        flat = ws.phash_from_gray(b"\x00" * 256)
+        self.assertEqual(flat, "0" * 16)
+        gradient = bytes((i * 7) % 256 for i in range(256))
+        self.assertEqual(ws.phash_from_gray(gradient), ws.phash_from_gray(gradient))
+        self.assertEqual(len(ws.phash_from_gray(gradient)), 16)
+        self.assertIsNone(ws.phash_from_gray(b"\x00" * 255))
+
+    def test_filename_id(self):
+        self.assertEqual(ws.pool_id_from_filename("wallhaven-94x34k.jpg"), "94x34k")
+        self.assertIsNone(ws.pool_id_from_filename("94x34k.jpg"))
+
+
+class HistoryTest(unittest.TestCase):
+    def test_append_and_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = ws.Paths(pool=Path(tmp) / "pool", state=Path(tmp) / "state", key_file=Path(tmp) / "key")
+            ws.append_history(paths, {"id": "abc123", "at": "1", "in_pool": True})
+            ws.append_history(paths, {"id": "def456", "at": "2", "in_pool": False})
+            events = ws.read_history(paths)
+            self.assertEqual([event["id"] for event in events], ["abc123", "def456"])
+
+    def test_record_reads_noctalia_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = Path(tmp) / "pool"
+            pool.mkdir()
+            wallpaper = pool / "wallhaven-abc123.jpg"
+            wallpaper.write_bytes(b"x")
+            paths = ws.Paths(pool=pool, state=Path(tmp) / "state", key_file=Path(tmp) / "key")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "NOCTALIA_WALLPAPER_PATH": str(wallpaper),
+                    "NOCTALIA_WALLPAPER_CONNECTOR": "eDP-1",
+                },
+            ):
+                ws.cmd_record(paths, None)
+            event = ws.read_history(paths)[-1]
+            self.assertEqual(event["id"], "abc123")
+            self.assertTrue(event["in_pool"])
+            self.assertEqual(event["connector"], "eDP-1")
+
+
+class DedupeApplyTest(unittest.TestCase):
+    def _paths(self, tmp):
+        pool = Path(tmp) / "pool"
+        pool.mkdir()
+        return ws.Paths(pool=pool, state=Path(tmp) / "state", key_file=Path(tmp) / "key")
+
+    def _index(self, paths, entries):
+        index = ws.new_index()
+        index["images"] = entries
+        ws.save_index(paths, index)
+        return index
+
+    def test_keeps_the_only_surviving_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(tmp)
+            (paths.pool / "lost.jpg").write_bytes(b"")
+            (paths.pool / "kept.jpg").write_bytes(b"")
+            # "lost" has a larger byte count but its file is missing.
+            self._index(paths, {
+                "aaaaaa": {"file": "gone.jpg", "bytes": 10_000_000, "phash": "0" * 16},
+                "bbbbbb": {"file": "kept.jpg", "bytes": 1, "phash": "0" * 15 + "1"},
+            })
+            args = mock.Mock(apply=True, threshold=7, auto=3, list_quarantine=False, restore=None)
+            ws.cmd_dedupe(paths, args)
+            self.assertTrue((paths.pool / "kept.jpg").exists())
+            index = ws.load_index(paths)
+            self.assertIn("bbbbbb", index["images"])
+            self.assertNotIn("bbbbbb", index["quarantine"])
+
+    def test_apply_moves_smaller_duplicate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(tmp)
+            (paths.pool / "big.jpg").write_bytes(b"x" * 20)
+            (paths.pool / "small.jpg").write_bytes(b"x")
+            self._index(paths, {
+                "aaaaaa": {"file": "big.jpg", "bytes": 20, "phash": "0" * 16},
+                "bbbbbb": {"file": "small.jpg", "bytes": 1, "phash": "0" * 15 + "1"},
+            })
+            args = mock.Mock(apply=True, threshold=7, auto=3, list_quarantine=False, restore=None)
+            ws.cmd_dedupe(paths, args)
+            self.assertTrue((paths.pool / "big.jpg").exists())
+            self.assertFalse((paths.pool / "small.jpg").exists())
+            index = ws.load_index(paths)
+            self.assertIn("bbbbbb", index["quarantine"])
+            self.assertEqual(index["quarantine"]["bbbbbb"]["of"], "aaaaaa")
+
+
+class DuplicateSkipTest(unittest.TestCase):
+    def test_skip_only_while_original_present(self):
+        index = {
+            "images": {"aaaaaa": {}},
+            "duplicates": {"bbbbbb": {"of": "aaaaaa"}, "cccccc": {"of": "gone00"}},
+        }
+        self.assertEqual(ws.blocked_duplicates(index), {"bbbbbb"})
 
 
 class HelpersTest(unittest.TestCase):

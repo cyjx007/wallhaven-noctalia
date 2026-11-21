@@ -119,18 +119,63 @@ Material You 本身保证文本对比度（实测 `on_surface/surface` 约 14:1�
 `hue-quota` / `muted-quota` 是**软拒绝**：不写永久黑名单，第一遍结束后若没满，
 自动进入宽松模式再补一遍。硬拒绝（太亮/太暗/太平/太大）才会永久跳过。
 
+## 展示历史
+
+在 Noctalia 配置里加一条钩子：
+
+```toml
+[hooks]
+wallpaper_changed = "wallhaven-sync record"
+```
+
+Noctalia 会传 `NOCTALIA_WALLPAPER_PATH` / `NOCTALIA_WALLPAPER_CONNECTOR`，
+`record` 往 `history.jsonl` 追加一行。自动轮换、`wallpaper-next`、手动选图都会记录；
+多显示器按 connector 分开。然后：
+
+```bash
+wallhaven-sync history --limit 30
+wallhaven-sync report
+```
+
+`report` 会给出已看过/从未展示、最常展示、来源/色相分布、pHash 覆盖和隔离区。
+
+## pHash 去重
+
+SHA-256 只能抓字节完全相同的文件。`dedupe` 用 pHash 找视觉重复（重新压缩、缩放、轻微调色）：
+
+```bash
+wallhaven-sync dedupe                 # 只报告，并把缺失的 pHash 缓存进 index
+wallhaven-sync dedupe --apply         # 隔离距离 ≤3 的重复（4–7 只报告）
+```
+
+- 16×16 灰度 → DCT → 8×8 → 64 位指纹；纯 Python，无 numpy。
+- 隔离到 `<池子目录>-quarantine/duplicates/`，不删除。
+- 被隔离的 ID 不会再次下载；`dedupe --restore <id>` 可以恢复。
+- 初始 365 张实测：1 对距离 2 的真重复（不同压缩，已隔离）、1 对距离 4 和 1 对距离 6
+  的相似图；后者只标记，不自动删。
+- `sync` 只拒绝距离 ≤3；4–7 正常入池，由 `dedupe` 报告。
+
 ## 命令
 
 ```bash
 wallhaven-sync sync                 # 补齐到 target
 wallhaven-sync sync --dry-run       # 只列候选，不写索引
 wallhaven-sync sync --retry-rejected
-wallhaven-sync status [--json]      # 数量、磁盘、色相分布、本轮轮换进度
+wallhaven-sync sync --retry-duplicates
+wallhaven-sync status [--json]      # 数量、磁盘、色相、pHash、历史、轮换进度
 wallhaven-sync doctor               # key/pool/Noctalia/Umbriel/最近日志
 wallhaven-sync preview <文件|id>    # 终端色块 + 亮度
 wallhaven-sync add <id|url>         # 手动加一张（--force 跳过品控）
 wallhaven-sync ban <id>             # 删除并拉黑
+wallhaven-sync dedupe [--apply]     # pHash 去重
+wallhaven-sync dedupe --list-quarantine
+wallhaven-sync dedupe --restore <id>
+wallhaven-sync history [--limit N]  # 展示历史
+wallhaven-sync report               # 统计报告
+wallhaven-sync record               # 给 Noctalia 钩子用
 ```
+
+完整能力见 [docs/CAPABILITIES.md](docs/CAPABILITIES.md)。
 
 API 用 `X-API-Key` 请求头，限流 1.4s/次；索引与图片都在本地，不进 git。
 
@@ -140,7 +185,7 @@ API 用 `X-API-Key` 请求头，限流 1.4s/次；索引与图片都在本地，
 `{{ colors.* }}` token，保留原来的形状：
 
 ```nix
-let fcitx5Templates = inputs.wallhaven-noctalia.packages.${pkgs.system}.fcitx5-noctalia-templates;
+let fcitx5Templates = inputs.wallhaven-noctalia.packages.${pkgs.stdenv.hostPlatform.system}.fcitx5-noctalia-templates;
 in {
   programs.noctalia.settings.theme.templates.user = {
     fcitx5-panel = { input_path = "${fcitx5Templates}/panel.svg"; output_path = "$XDG_DATA_HOME/fcitx5/themes/noctalia/panel.svg"; index = 0; };
