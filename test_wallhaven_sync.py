@@ -477,6 +477,22 @@ class VictimTest(unittest.TestCase):
             self.assertIn("a1", victims)
 
 
+    def test_history_fallback_when_db_has_no_show_timestamps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths, index = self._setup(tmp)
+            with ws.open_db(paths) as conn:
+                conn.execute("UPDATE images SET last_shown_at=NULL")
+                conn.commit()
+            ws.append_history(
+                paths,
+                {"id": "a1", "at": "2026-11-01T00:00:00+00:00", "in_pool": True},
+            )
+            victims = ws.select_victims(
+                paths, index, 3, protect=set(), protect_recent_hours=0
+            )
+            self.assertEqual(victims, ["a1"])
+
+
 class TrashTest(unittest.TestCase):
     def _paths(self, tmp):
         pool = Path(tmp) / "pool"
@@ -648,6 +664,36 @@ class ReplenishTest(unittest.TestCase):
             synced.assert_called_once()
             self.assertIn("a1", ws.load_index(paths)["images"])
             self.assertTrue((paths.pool / "wallhaven-a1.jpg").exists())
+
+
+class CurrentWallpaperTest(unittest.TestCase):
+    def test_parses_noctalia_output(self):
+        with mock.patch.object(ws.shutil, "which", return_value="/bin/noctalia"), mock.patch.object(
+            ws, "run", return_value="/pool/wallhaven-abc123.jpg\n"
+        ):
+            self.assertEqual(ws.current_wallpaper_ids(), {"abc123"})
+
+    def test_unknown_when_command_fails(self):
+        with mock.patch.object(ws.shutil, "which", return_value="/bin/noctalia"), mock.patch.object(
+            ws, "run", side_effect=RuntimeError("boom")
+        ), mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(ws.current_wallpaper_ids())
+
+    def test_ban_refuses_current_wallpaper(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = Path(tmp) / "pool"
+            pool.mkdir()
+            paths = ws.Paths(pool=pool, state=Path(tmp) / "state", key_file=Path(tmp) / "key")
+            (pool / "wallhaven-abc123.jpg").write_bytes(b"x")
+            index = ws.new_index()
+            index["images"]["abc123"] = {"file": "wallhaven-abc123.jpg", "stats": {}, "palette": {}}
+            ws.save_index(paths, index)
+            args = argparse.Namespace(id="abc123", reason=None, force=False)
+            with mock.patch.object(ws, "current_wallpaper_ids", return_value={"abc123"}):
+                with self.assertRaises(SystemExit):
+                    ws.cmd_ban(paths, args)
+            self.assertTrue((pool / "wallhaven-abc123.jpg").exists())
+            self.assertIn("abc123", ws.load_index(paths)["images"])
 
 
 if __name__ == "__main__":

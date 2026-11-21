@@ -85,7 +85,7 @@ in
 
     systemd.user.services.wallhaven-sync = {
       Unit = {
-        Description = "Top up the wallhaven wallpaper pool";
+        Description = "Replenish the wallhaven wallpaper pool (daily rolling window)";
       } // lib.optionalAttrs (cfg.keyFile != null) {
         ConditionPathExists = cfg.keyFile;
       };

@@ -53,7 +53,7 @@ DB 的 `status` 是 evicted/quarantine/banned 的唯一权威。`index.json` 只
 
 ```
 1. 清理超过 N 天的回收站
-2. 计算今日配额 = max_per_day - 今天已淘汰数（UTC 日期）
+2. 计算今日配额 = max_per_day - 今天已淘汰数（本地日期）
 3. 选候选旧图：
      - 只选 active、非 pinned、非当前壁纸、最近 2h 没展示过
      - 按 last_shown_at 从旧到新

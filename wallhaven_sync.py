@@ -473,9 +473,11 @@ def db_record_display(paths: Paths, image_id: str, connector: str | None, path: 
                 (image_id, Path(path).name),
             )
             last = conn.execute(
-                "SELECT id, connector FROM display_history ORDER BY seq DESC LIMIT 1"
+                "SELECT id FROM display_history WHERE connector IS ? "
+                "ORDER BY seq DESC LIMIT 1",
+                (connector,),
             ).fetchone()
-            repeated = bool(last and last["id"] == image_id and last["connector"] == connector)
+            repeated = bool(last and last["id"] == image_id)
             conn.execute(
                 "INSERT INTO display_history (id, shown_at, connector, source, path) "
                 "VALUES (?, ?, ?, 'noctalia', ?)",
@@ -1478,12 +1480,21 @@ def select_victims(
     rows = {row["id"]: row for row in db_eviction_rows(paths)}
     recent = db_recently_shown(paths, protect_recent_hours)
     history_last: dict[str, str] = {}
-    if len(rows) < len(index["images"]):
-        # Partial DB (first run / dry-run): fall back to history.jsonl for IDs
-        # that are not mirrored yet, without writing anything.
+    if len(rows) < len(index["images"]) or any(
+        not row.get("last_shown_at") for row in rows.values()
+    ):
+        # Partial DB / pre-1.1 history: fill last_shown_at from history.jsonl
+        # for rows the hook has not touched since the DB was created.
         for event in read_history(paths):
             if event.get("in_pool") and event.get("id"):
                 history_last[str(event["id"])] = str(event.get("at") or "")
+        if protect_recent_hours > 0:
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=protect_recent_hours)
+            ).replace(microsecond=0).isoformat()
+            recent |= {
+                image_id for image_id, at in history_last.items() if at and at >= cutoff
+            }
     shown: list[tuple[str, str]] = []
     unseen: list[tuple[str, str]] = []
     for image_id, entry in index["images"].items():
