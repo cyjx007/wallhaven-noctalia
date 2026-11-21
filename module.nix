@@ -89,11 +89,24 @@ in
         never evicted.  The API has no favourites endpoint and no write access.
       '';
     };
+
+    maxBytes = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 3 * 1024 * 1024 * 1024;
+      description = ''
+        Hard byte cap for the active pool.  Downloads stop at the cap, and the
+        daily job evicts beyond `maxPerDay` if the pool is already over it.
+        This is independent of `target`, so a stuck eviction cannot let the
+        pool grow forever.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
     home.packages = [ package ];
-    home.sessionVariables = lib.mkIf (cfg.username != null) {
+    home.sessionVariables = {
+      WALLHAVEN_MAX_BYTES = toString cfg.maxBytes;
+    } // lib.optionalAttrs (cfg.username != null) {
       WALLHAVEN_USERNAME = cfg.username;
     };
 
@@ -105,8 +118,8 @@ in
       };
       Service = {
         Type = "oneshot";
-        ExecStart = "${package}/bin/wallhaven-sync replenish --max-per-day ${toString cfg.maxPerDay} --keep-trash-days ${toString cfg.trashDays}";
-        Environment = [ "PYTHONUNBUFFERED=1" ]
+        ExecStart = "${package}/bin/wallhaven-sync replenish --max-per-day ${toString cfg.maxPerDay} --keep-trash-days ${toString cfg.trashDays} --max-bytes ${toString cfg.maxBytes}";
+        Environment = [ "PYTHONUNBUFFERED=1" "WALLHAVEN_MAX_BYTES=${toString cfg.maxBytes}" ]
           ++ lib.optional (cfg.username != null) "WALLHAVEN_USERNAME=${cfg.username}";
         Nice = 10;
         IOSchedulingClass = "idle";

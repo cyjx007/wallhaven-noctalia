@@ -228,6 +228,153 @@ class DuplicateSkipTest(unittest.TestCase):
         self.assertEqual(ws.blocked_duplicates(index), {"bbbbbb"})
 
 
+class CapacityTest(unittest.TestCase):
+    def _setup(self, tmp, count=5):
+        pool = Path(tmp) / "pool"
+        pool.mkdir()
+        paths = ws.Paths(pool=pool, state=Path(tmp) / "state", key_file=Path(tmp) / "key")
+        index = ws.new_index()
+        for number in range(count):
+            image_id = f"a{number}"
+            entry = {
+                "file": f"wallhaven-{image_id}.jpg",
+                "source": "toplist:1M:p1",
+                "theme": "toplist",
+                "added_at": "2026-01-01T00:00:00+00:00",
+                "bytes": 100,
+                "stats": {},
+                "palette": {},
+            }
+            (pool / entry["file"]).write_bytes(b"x" * 100)
+            index["images"][image_id] = entry
+        ws.save_index(paths, index)
+        ws.mirror_index_to_db(paths, index)
+        with ws.open_db(paths) as conn:
+            conn.execute("UPDATE images SET last_shown_at='2026-11-01T00:00:00+00:00'")
+            conn.commit()
+        return paths, index
+
+    def _args(self, **overrides):
+        values = {
+            "target": 5,
+            "max_bytes": 0,
+            "protect_recent_hours": 0,
+            "dry_run": False,
+        }
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def test_count_cap_evicts_beyond_daily_quota(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths, index = self._setup(tmp)
+            removed = ws.enforce_capacity(
+                paths, index, self._args(target=3), set(), protection_known=True
+            )
+            self.assertEqual(len(removed), 2)
+            self.assertEqual(len(index["images"]), 3)
+            self.assertEqual(ws.pool_usage(paths.pool)[0], 3)
+
+    def test_byte_cap_evicts_until_under_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths, index = self._setup(tmp)
+            ws.enforce_capacity(
+                paths,
+                index,
+                self._args(max_bytes=250),
+                set(),
+                protection_known=True,
+            )
+            count, used = ws.pool_usage(paths.pool)
+            self.assertLessEqual(used, 250)
+            self.assertEqual(count, len(index["images"]))
+
+    def test_capacity_skips_when_wallpaper_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths, index = self._setup(tmp)
+            removed = ws.enforce_capacity(
+                paths, index, self._args(target=1), set(), protection_known=False
+            )
+            self.assertEqual(removed, [])
+            self.assertEqual(len(index["images"]), 5)
+
+
+class TemporaryFileTest(unittest.TestCase):
+    def test_cleanup_incoming_only_removes_stale_parts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = Path(tmp) / "pool"
+            pool.mkdir()
+            paths = ws.Paths(pool=pool, state=Path(tmp) / "state", key_file=Path(tmp) / "key")
+            stale = pool / ".incoming-old.part"
+            fresh = pool / ".incoming-new.part"
+            stale.write_bytes(b"x")
+            fresh.write_bytes(b"x")
+            past = ws.time.time() - 48 * 3600
+            os.utime(stale, (past, past))
+            ws.cleanup_incoming(paths)
+            self.assertFalse(stale.exists())
+            self.assertTrue(fresh.exists())
+
+
+class SyncCapacityTest(unittest.TestCase):
+    def test_stops_before_exceeding_max_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = Path(tmp) / "pool"
+            paths = ws.Paths(pool=pool, state=Path(tmp) / "state", key_file=Path(tmp) / "key")
+            items = [
+                {
+                    "id": f"a{number}",
+                    "purity": "sfw",
+                    "category": "general",
+                    "file_size": 100,
+                    "path": f"https://example.invalid/{number}.jpg",
+                    "resolution": "1920x1080",
+                    "dimension_x": 1920,
+                    "dimension_y": 1080,
+                }
+                for number in range(5)
+            ]
+
+            def fake_download(url, destination):
+                destination.write_bytes(b"x" * 100)
+                return 100, f"sha{url[-5:]}"
+
+            args = argparse.Namespace(
+                target=5,
+                dry_run=False,
+                retry_rejected=False,
+                retry_duplicates=False,
+                force_prune=False,
+                max_pages=None,
+                page_offset=0,
+                max_bytes=150,
+                limit=10,
+                tags="",
+                no_tags=True,
+                include_latest=False,
+                min_favorites=0,
+                min_views=0,
+            )
+            with mock.patch.object(ws, "read_key", return_value="k" * 20), mock.patch.object(
+                ws, "build_sources", return_value=[]
+            ), mock.patch.object(
+                ws, "iter_candidates",
+                return_value=iter((item, "toplist:1M:p1") for item in items),
+            ), mock.patch.object(
+                ws, "download_with_retry", side_effect=fake_download
+            ), mock.patch.object(
+                ws, "image_stats", return_value={"luma": 0.3, "stddev": 0.2, "sat": 0.4}
+            ), mock.patch.object(
+                ws, "palette_info", return_value=None
+            ), mock.patch.object(
+                ws, "image_phash", return_value="0" * 16
+            ), mock.patch.object(
+                ws, "judge", return_value=None
+            ):
+                ws.sync_locked(paths, args)
+            self.assertEqual(len(ws.load_index(paths)["images"]), 1)
+            self.assertEqual(ws.pool_usage(pool)[1], 100)
+
+
 class HelpersTest(unittest.TestCase):
     def test_extension_for_prefers_url_suffix(self):
         item = {"path": "https://w.wallhaven.cc/full/ab/wallhaven-abcd12.png", "file_type": "image/jpeg"}
@@ -241,6 +388,14 @@ class HelpersTest(unittest.TestCase):
         self.assertEqual(ws.format_bytes(512), "512 B")
         self.assertEqual(ws.format_bytes(2048), "2.0 KiB")
         self.assertTrue(ws.format_bytes(5 * 1024**3).endswith("GiB"))
+
+    def test_retry_delay_is_exponential_and_honours_retry_after(self):
+        first = ws.retry_delay(1)
+        third = ws.retry_delay(3)
+        self.assertGreaterEqual(first, 2.0)
+        self.assertLessEqual(first, 2.5)
+        self.assertGreater(third, first)
+        self.assertGreaterEqual(ws.retry_delay(1, 120), 120)
 
     def test_api_reject_reason(self):
         self.assertEqual(ws.api_reject_reason({"purity": "nsfw"}), "not-sfw")
@@ -600,6 +755,7 @@ class ReplenishTest(unittest.TestCase):
             "include_latest": False,
             "min_favorites": 0,
             "min_views": 0,
+            "max_bytes": 0,
         }
         values.update(overrides)
         return argparse.Namespace(**values)

@@ -48,7 +48,10 @@ wallhaven API（Toplist 1M/3M/6M/1y + 标签 + Latest）
 - 只 general（`categories=100`），SFW，16:9，至少 1920×1080，≤16 MiB。
 - 目标张数默认 365；首次运行补满，之后由 `replenish` 维持。
 - 首次全量约 1.4 GiB / 2 小时；可中断，索引逐张落盘。
-- API 用 `X-API-Key` 头；所有端点统一限速 1.4s/次；429 读 `Retry-After`。
+- API 用 `X-API-Key` 头；所有端点统一限速 1.4s/次；429 优先遵守 `Retry-After`，
+  5xx/网络错误指数退避 + 抖动（最多 5 次）。
+- 下载先写 `<pool>/.incoming-<id>.part`，校验（SHA/pHash/品控）+ `fsync` 通过后
+  才 `os.replace` 成正式文件名；半张图、0 字节文件不会进池。
 - 单个来源失败只跳过该来源，不影响后面的来源。
 - 断点续跑、原子写索引、`fsync`、并发锁。
 - 下载失败/过大/无法解析不会中断整次同步。
@@ -149,6 +152,9 @@ Noctalia 提供 `NOCTALIA_WALLPAPER_PATH` / `NOCTALIA_WALLPAPER_CONNECTOR`。
   默认跳过淘汰（`--force` 才继续）。最近 2 小时展示过的也跳过。
 - 从未展示过的图默认不淘汰（`--evict-unshown` 可改）。
 - 补货失败时一张旧图都不删。
+- **硬容量上限 `max_bytes`（默认 3 GiB）**：`sync` 到上限停止下载；`replenish` 发现
+  active 超过 target 或池子超过字节上限时，无视每日配额继续淘汰（仍保护当前壁纸、
+  pin、最近展示），并把 24h 以上的索引外文件移到回收站。
 - 被淘汰的 ID 和 pHash 留在 DB，后续不会重新下载。
 - `pin <id>` 的图永不淘汰；`restore <id>` 可从回收站或 Wallhaven 恢复。
 - Noctalia 每次挑图都会把 `seen` 与当前目录求交集，所以删掉旧文件不会破坏轮换状态。

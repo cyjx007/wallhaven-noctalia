@@ -65,7 +65,13 @@ DB 的 `status` 是 evicted/quarantine/banned 的唯一权威。`index.json` 只
 6. 移动文件到回收站，更新 index + DB
 7. 对淘汰的图调用 /w/{id} 补 tags（≤24 次/天）
 8. 把 index.target 恢复为真实 target
+9. 硬容量保护：active 超过 target 或池子超过 max_bytes 时，
+   无视每日配额继续淘汰（仍保护当前壁纸/pin/最近展示），并清理 24h 以上的索引外文件
 ```
+
+**容量上限**：`max_bytes`（默认 3 GiB）是独立于 `target` 的硬上限。`sync` 在下载前
+同时检查张数和字节数；`replenish` 在补货后如果发现超限，会额外淘汰到 target/字节数以下。
+每日 24 张只是“常规换血速度”，不是唯一的容量保护。
 
 **为什么先补后删**：如果先删后补，网络中断会让池子缩水；反过来最多只是临时多占
 24 张图（约 100 MiB），失败时旧图原样保留。
@@ -92,7 +98,9 @@ Latest（sorting=date_added）
 
 - `categories=100`：只 general（用户选择）。
 - 标签查询用 `q=+tag`（必须含该标签）。
-- 每次请求间隔由 `api_get()` 统一限速（1.4s，约 43 次/分钟）。
+- 每次请求间隔由 `api_get()` 统一限速（1.4s，约 43 次/分钟）；429 优先遵守
+  `Retry-After`，其余 5xx/网络错误指数退避 + 抖动（最多 5 次）。
+- 下载同样走 `.part` → 校验 → `fsync` → `os.replace`，并独立重试 5 次。
 - `replenish` 默认每个来源只翻 2 页，并按日期轮换起始页（0–19），避免每天都从
   第一页开始、反复扫描已经全部见过的候选。
 - `sync`（首次填充/手动）从第 1 页开始，可以深翻。
@@ -117,6 +125,9 @@ Latest（sorting=date_added）
 | `noctalia msg wallpaper-get` 失败 | **不淘汰**，除非显式 `--force` |
 | 池目录缺失 >50% | 拒绝清空索引，需 `--force-prune` |
 | 下载失败/超大/无法解码 | 跳过该候选，不中断整次运行 |
+| API 429 / 5xx / 网络抖动 | 指数退避 + 抖动，优先 `Retry-After`；5 次后放弃该候选 |
+| 下载中途断开 / 0 字节 | 只在 `.incoming-*.part` 里写，校验 + `fsync` 后才改名；不会进池 |
+| 池子超过 `max_bytes` / target | 停止下载；`replenish` 无视每日配额硬淘汰到上限以下 |
 | 索引写入失败 | 淘汰时把文件移回原处并保留索引条目 |
 | DB 写入失败 | warning；index 仍是权威，下次镜像会修复 |
 | 钩子写 DB 超时 | 1 秒超时后放弃，绝不影响换壁纸 |

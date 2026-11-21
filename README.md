@@ -45,6 +45,7 @@ services.wallhaven = {
   maxPerDay = 24;    # 每天淘汰/补入的张数（0 = 只补不淘汰）
   trashDays = 7;     # 淘汰图在 <poolDir>-trash/ 保留几天
   username = "alice"; # 可选：每日只读 collections 做 pin 保护名单
+  maxBytes = 3 * 1024 * 1024 * 1024; # active 池硬上限（默认 3 GiB）
 };
 ```
 
@@ -138,6 +139,9 @@ Material You 本身保证文本对比度（实测 `on_surface/surface` 约 14:1�
 - **当前正在显示的壁纸不会被删**：用 `noctalia msg wallpaper-get` 确认，失败时默认放弃淘汰。
 - 从未展示过的图默认不淘汰；`--evict-unshown` 才允许。
 - 先补后删：网络失败时一张旧图都不删。
+- **硬容量上限**：默认 3 GiB；`sync` 到上限停止下载，`replenish` 超限时无视每日配额
+  继续淘汰（仍保护当前壁纸/pin/最近展示）。24 张/天只是常规换血速度。
+- 下载先写 `.incoming-*.part`，校验 + `fsync` 后才原子改名入池。
 - 被淘汰的 ID/pHash 留在 SQLite，不会重新下载回来。
 - `pin <id>` 永不淘汰；`restore <id>` 从回收站或 Wallhaven 恢复。
 

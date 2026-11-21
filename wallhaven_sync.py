@@ -30,6 +30,7 @@ import http.client
 import json
 import math
 import os
+import random
 import re
 import shutil
 import sqlite3
@@ -65,6 +66,11 @@ LATEST_MIN_FAVORITES = 100
 LATEST_MIN_VIEWS = 2000
 DEFAULT_MAX_PER_DAY = 24
 DEFAULT_TRASH_DAYS = 7
+DEFAULT_MAX_BYTES = 3 * 1024**3  # 3 GiB hard cap for the active pool
+API_ATTEMPTS = 5
+DOWNLOAD_ATTEMPTS = 5
+BACKOFF_BASE = 2.0
+BACKOFF_CAP = 300.0
 DB_VERSION = 1
 API_DELAY = 1.4  # wallhaven 限流 45 次/分钟；1.4s 约 43 次
 _last_api_call = 0.0
@@ -671,6 +677,22 @@ def read_key(paths: Paths) -> str:
     return key
 
 
+def retry_delay(attempt: int, retry_after: int | None = None) -> float:
+    """Exponential backoff with jitter; honour Retry-After if it is longer."""
+    base = min(BACKOFF_CAP, BACKOFF_BASE * (2 ** max(0, attempt - 1)))
+    delay = base * (1 + random.uniform(0.0, 0.25))
+    if retry_after is not None:
+        delay = max(delay, float(retry_after))
+    return delay
+
+
+def _retry_after(exc: urllib.error.HTTPError) -> int | None:
+    value = exc.headers.get("Retry-After") if exc.headers else None
+    if value and value.strip().isdigit():
+        return int(value)
+    return None
+
+
 def api_get(key: str, endpoint: str, params: dict) -> dict:
     global _last_api_call
     url = f"{API_ROOT}/{endpoint}?" + urllib.parse.urlencode(params)
@@ -681,7 +703,7 @@ def api_get(key: str, endpoint: str, params: dict) -> dict:
         "X-API-Key": key,
     }
     last_error: Exception | None = None
-    for attempt in range(1, 4):
+    for attempt in range(1, API_ATTEMPTS + 1):
         # Central rate limit: every endpoint (search, w/{id}, collections) shares
         # the same 45/min budget, so the delay belongs here, not in the caller.
         wait = API_DELAY - (time.monotonic() - _last_api_call)
@@ -695,18 +717,21 @@ def api_get(key: str, endpoint: str, params: dict) -> dict:
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", "replace")[:200]
             if exc.code == 429:
-                retry_after = exc.headers.get("Retry-After") if exc.headers else None
-                wait = int(retry_after) if retry_after and retry_after.isdigit() else 60
-                warn(f"wallhaven 限流，{wait}s 后重试")
+                wait = retry_delay(attempt, _retry_after(exc))
+                warn(f"wallhaven 限流（第 {attempt}/{API_ATTEMPTS} 次），{wait:.0f}s 后重试")
                 time.sleep(wait)
                 last_error = exc
                 continue
             if exc.code in (401, 403):
                 raise SystemExit(f"wallhaven 拒绝了这个 API key（HTTP {exc.code}）：{body}") from exc
+            if 400 <= exc.code < 500:
+                # 404/400 重试也不会变好；让调用方决定怎么处理。
+                raise RuntimeError(f"wallhaven API 返回 HTTP {exc.code}：{body}") from exc
             last_error = exc
         except (urllib.error.URLError, TimeoutError, http.client.HTTPException) as exc:
             last_error = exc
-        time.sleep(2 * attempt)
+        if attempt < API_ATTEMPTS:
+            time.sleep(retry_delay(attempt))
     raise RuntimeError(f"wallhaven API 请求失败：{last_error}")
 
 
@@ -728,19 +753,35 @@ def download(url: str, destination: Path, max_bytes: int = MAX_DOWNLOAD_BYTES) -
                 raise TooLarge(f"{size} bytes")
             digest.update(chunk)
             handle.write(chunk)
+        if size == 0:
+            raise RuntimeError("下载到 0 字节，拒绝入池")
+        # The caller renames this .part file only after quality checks pass.
+        # fsync here keeps a power loss from leaving a truncated "complete" file
+        # behind once the rename has happened.
+        handle.flush()
+        os.fsync(handle.fileno())
     return size, digest.hexdigest()
 
 
 def download_with_retry(url: str, destination: Path) -> tuple[int, str]:
     last_error: Exception | None = None
-    for attempt in range(1, 4):
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        retry_after = None
         try:
             return download(url, destination)
         except TooLarge:
             raise
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403, 404):
+                raise RuntimeError(f"下载被拒绝（HTTP {exc.code}）：{url}") from exc
+            retry_after = _retry_after(exc)
+            last_error = exc
         except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException, OSError) as exc:
             last_error = exc
-            time.sleep(2 * attempt)
+        if attempt < DOWNLOAD_ATTEMPTS:
+            wait = retry_delay(attempt, retry_after)
+            warn(f"下载失败（第 {attempt}/{DOWNLOAD_ATTEMPTS} 次），{wait:.0f}s 后重试：{url}")
+            time.sleep(wait)
     raise RuntimeError(f"下载失败 {url}：{last_error}")
 
 
@@ -1185,6 +1226,20 @@ def sync_locked(paths: Paths, args: argparse.Namespace) -> int:
         print(f"池子已满（{len(index['images'])}/{target}），不再下载。", flush=True)
         return 0
 
+    max_bytes = int(getattr(args, "max_bytes", 0) or 0)
+    used_bytes = 0
+    for pool_file in pool_images(paths.pool):
+        try:
+            used_bytes += pool_file.stat().st_size
+        except OSError:
+            pass
+    if max_bytes and used_bytes >= max_bytes:
+        print(
+            f"池子已达容量上限（{format_bytes(used_bytes)} / {format_bytes(max_bytes)}），不再下载。",
+            flush=True,
+        )
+        return 0
+
     if not dry_run:
         free = shutil.disk_usage(paths.pool).free
         estimate = (target - len(index["images"])) * 6 * 1024 * 1024
@@ -1205,10 +1260,11 @@ def sync_locked(paths: Paths, args: argparse.Namespace) -> int:
     accepted = 0
     considered = 0
     deferred = 0
+    capacity_full = False
 
     # 第一遍按配额精挑；如果候选被配额拦得太多，第二遍忽略配额补齐。
     for relaxed in ((False,) if dry_run else (False, True)):
-        if len(index["images"]) >= target:
+        if capacity_full or len(index["images"]) >= target:
             break
         if relaxed:
             if deferred == 0:
@@ -1243,6 +1299,16 @@ def sync_locked(paths: Paths, args: argparse.Namespace) -> int:
                 if not dry_run:
                     save_index(paths, index)
                 continue
+
+            estimated = int(item.get("file_size") or 0)
+            if not dry_run and max_bytes and used_bytes + estimated > max_bytes:
+                print(
+                    f"池子达到容量上限（{format_bytes(used_bytes)} / {format_bytes(max_bytes)}），"
+                    "停止下载。",
+                    flush=True,
+                )
+                capacity_full = True
+                break
 
             if dry_run:
                 print(
@@ -1359,6 +1425,7 @@ def sync_locked(paths: Paths, args: argparse.Namespace) -> int:
             if phash:
                 phashes[image_id] = phash
             accepted += 1
+            used_bytes += size
             save_index(paths, index)
             palette_text = (
                 f"hue={palette['hue']:3d} chroma={palette['chroma']:3d}"
@@ -1371,6 +1438,8 @@ def sync_locked(paths: Paths, args: argparse.Namespace) -> int:
                 flush=True,
             )
             time.sleep(DOWNLOAD_DELAY)
+        if capacity_full:
+            break
 
     if not dry_run:
         save_index(paths, index)
@@ -1517,7 +1586,13 @@ def select_victims(
     return ordered[:limit]
 
 
-def evict_batch(paths: Paths, index: dict, victims: list[str], args: argparse.Namespace) -> list[str]:
+def evict_batch(
+    paths: Paths,
+    index: dict,
+    victims: list[str],
+    args: argparse.Namespace,
+    reason: str = "rotation",
+) -> list[str]:
     """Move victims to <pool>-trash/YYYYMM and mark them evicted in the DB."""
     if not victims:
         return []
@@ -1569,15 +1644,102 @@ def evict_batch(paths: Paths, index: dict, victims: list[str], args: argparse.Na
             except OSError as rollback:
                 warn(f"回滚文件失败：{rollback}")
             continue
-        db_set_status(paths, image_id, "evicted", reason="rotation", trash_path=str(destination))
+        db_set_status(paths, image_id, "evicted", reason=reason, trash_path=str(destination))
         evicted.append(image_id)
         print(f"淘汰 {image_id} -> {destination}")
     return evicted
 
 
+def prune_orphans(paths: Paths, index: dict, min_age_hours: float = 24.0) -> list[str]:
+    """Move pool files that the index does not know about into the trash.
+
+    Only used when the hard capacity cap is exceeded; a grace period avoids
+    touching a file that was just copied in manually.
+    """
+    known = {entry.get("file") for entry in index["images"].values()}
+    cutoff = time.time() - min_age_hours * 3600
+    destination_dir = paths.trash / "orphans" / datetime.now().strftime("%Y%m")
+    moved: list[str] = []
+    for path in pool_images(paths.pool):
+        if path.name in known:
+            continue
+        try:
+            if path.stat().st_mtime > cutoff:
+                continue
+            destination_dir.mkdir(parents=True, exist_ok=True)
+            destination = destination_dir / path.name
+            if path.stat().st_dev != destination_dir.stat().st_dev:
+                shutil.move(str(path), str(destination))
+            else:
+                os.replace(path, destination)
+            os.utime(destination, None)
+            moved.append(path.name)
+            print(f"容量保护：移走索引外文件 {path.name} -> {destination}", flush=True)
+        except OSError as exc:
+            warn(f"移走索引外文件 {path} 失败：{exc}")
+    return moved
+
+
+def enforce_capacity(
+    paths: Paths,
+    index: dict,
+    args: argparse.Namespace,
+    protect: set[str],
+    protection_known: bool = False,
+) -> list[str]:
+    """Hard cap: active count <= target and pool bytes <= max_bytes.
+
+    This is deliberately independent of the daily quota.  It only kicks in when
+    the pool is already over the cap, and it still protects the current
+    wallpaper, pins and recently shown images.
+    """
+    max_bytes = int(getattr(args, "max_bytes", 0) or 0)
+    target = int(args.target)
+    if max_bytes <= 0 and len(index["images"]) <= target:
+        return []
+    if not protection_known:
+        return []
+    removed: list[str] = []
+    for _ in range(50):
+        count, used = pool_usage(paths.pool)
+        over_count = max(0, len(index["images"]) - target)
+        over_bytes = max(0, used - max_bytes) if max_bytes else 0
+        if over_count <= 0 and over_bytes <= 0 and count <= target:
+            break
+        limit = min(50, max(over_count, 1 if over_bytes else 0))
+        victims = select_victims(
+            paths,
+            index,
+            limit,
+            protect,
+            include_unshown=True,
+            protect_recent_hours=float(getattr(args, "protect_recent_hours", 2.0)),
+        )
+        if victims:
+            batch = evict_batch(paths, index, victims, args, reason="capacity")
+            if batch:
+                removed.extend(batch)
+                print(f"容量保护：额外淘汰 {len(batch)} 张。", flush=True)
+                continue
+        # No indexed image can be evicted (all pinned/current/recent); try
+        # stale orphan files before giving up.
+        orphans = prune_orphans(paths, index)
+        if not orphans:
+            warn(
+                f"容量仍超限（{format_bytes(used)} / {format_bytes(max_bytes)}，"
+                f"{count} 张），但没有可淘汰的图"
+            )
+            break
+        removed.extend(orphans)
+    return removed
+
+
 def enrich_evicted_tags(paths: Paths, key: str, image_ids: list[str]) -> None:
     """Search results omit tags; fetch each evicted image once (≤24/day)."""
     for image_id in image_ids:
+        if not re.fullmatch(r"[a-z0-9]{6}", image_id):
+            # capacity enforcement may report orphan file names, not IDs
+            continue
         try:
             item = fetch_item(key, image_id)
         except (RuntimeError, SystemExit) as exc:
@@ -1622,18 +1784,13 @@ def cmd_replenish(paths: Paths, args: argparse.Namespace) -> int:
         if args.max_per_day > 0 and already >= args.max_per_day:
             print(f"今天已淘汰 {already}/{args.max_per_day} 张，本次只补货。", flush=True)
 
-        protect: set[str] = set()
+        current = current_wallpaper_ids()
+        protection_known = current is not None or args.force
+        protect: set[str] = current or set()
         planned: list[str] = []
-        if budget > 0:
-            current = current_wallpaper_ids()
-            if current is None:
-                if args.force:
-                    warn("无法确定当前壁纸，--force 继续（可能删掉正在显示的图）")
-                else:
-                    warn("无法确定当前壁纸（noctalia msg wallpaper-get 失败），跳过淘汰；确认后加 --force")
-                    budget = 0
-            else:
-                protect = current
+        if budget > 0 and not protection_known:
+            warn("无法确定当前壁纸（noctalia msg wallpaper-get 失败），跳过淘汰；确认后加 --force")
+            budget = 0
         if budget > 0:
             planned = select_victims(
                 paths,
@@ -1664,6 +1821,7 @@ def cmd_replenish(paths: Paths, args: argparse.Namespace) -> int:
             force_prune=False,
             max_pages=args.max_pages,
             page_offset=page_offset,
+            max_bytes=args.max_bytes,
             limit=args.limit,
             tags=args.tags,
             no_tags=args.no_tags,
@@ -1677,22 +1835,33 @@ def cmd_replenish(paths: Paths, args: argparse.Namespace) -> int:
             if not args.dry_run:
                 set_index_target(paths, args.target)
             raise
-        if not args.dry_run and (result != 0 or not planned):
-            set_index_target(paths, args.target)
-        if result != 0 or args.dry_run or not planned:
+        if result != 0 or args.dry_run:
             return result
 
         index = set_index_target(paths, args.target)
         surplus = max(0, len(index["images"]) - args.target)
-        if surplus <= 0:
-            print("没有补到新图，保留所有旧图。", flush=True)
-            return 0
-        victims = [image_id for image_id in planned if image_id in index["images"]][:surplus]
-        evicted = evict_batch(paths, index, victims, args)
-        if evicted:
-            key = read_key(paths)
-            enrich_evicted_tags(paths, key, evicted)
-            print(f"本轮淘汰 {len(evicted)} 张，补货后池子 {len(index['images'])} 张。", flush=True)
+        removed: list[str] = []
+        if surplus > 0 and planned:
+            victims = [image_id for image_id in planned if image_id in index["images"]][:surplus]
+            removed.extend(evict_batch(paths, index, victims, args))
+        removed.extend(
+            enforce_capacity(
+                paths,
+                index,
+                args,
+                protect,
+                protection_known=protection_known,
+            )
+        )
+        if removed:
+            ids = [item for item in removed if re.fullmatch(r"[a-z0-9]{6}", item)]
+            if ids:
+                key = read_key(paths)
+                enrich_evicted_tags(paths, key, ids)
+            print(
+                f"本轮淘汰 {len(removed)} 张，补货后池子 {len(index['images'])} 张。",
+                flush=True,
+            )
         return 0
 
 
@@ -1998,6 +2167,18 @@ def pool_images(pool: Path) -> list[Path]:
     return [p for p in pool.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES]
 
 
+def pool_usage(pool: Path) -> tuple[int, int]:
+    """(image count, bytes) of everything currently in the pool directory."""
+    files = pool_images(pool)
+    total = 0
+    for path in files:
+        try:
+            total += path.stat().st_size
+        except OSError:
+            pass
+    return len(files), total
+
+
 def format_bytes(size: int) -> str:
     for unit in ("B", "KiB", "MiB", "GiB"):
         if size < 1024 or unit == "GiB":
@@ -2093,6 +2274,7 @@ def cmd_status(paths: Paths, args: argparse.Namespace) -> int:
     phash_ready = sum(1 for entry in images.values() if entry.get("phash"))
     library = db_counts(paths)
     evicted_today = db_evicted_today(paths)
+    max_bytes = _int_env("WALLHAVEN_MAX_BYTES", DEFAULT_MAX_BYTES)
     trash = trash_files(paths)
     trash_bytes = 0
     for path in trash:
@@ -2108,6 +2290,7 @@ def cmd_status(paths: Paths, args: argparse.Namespace) -> int:
             "files": len(files),
             "target": target,
             "bytes": disk,
+            "max_bytes": max_bytes,
             "hue_buckets": hue_buckets(index),
             "rejected": len(index["rejected"]),
             "duplicates": len(index["duplicates"]),
@@ -2125,6 +2308,10 @@ def cmd_status(paths: Paths, args: argparse.Namespace) -> int:
 
     print(f"池子      {paths.pool}")
     print(f"数量      {len(images)}/{target} 张（磁盘 {format_bytes(disk)}，文件 {len(files)}）")
+    print(
+        f"容量      {format_bytes(disk)} / {format_bytes(max_bytes)}"
+        f"{'  ⚠ 超限' if max_bytes and disk > max_bytes else ''}"
+    )
     print(f"拒绝      {len(index['rejected'])} 个    重复 {len(index['duplicates'])} 个    拉黑 {len(index['banned'])} 个")
     print(f"指纹      pHash {phash_ready}/{len(images)} 张    隔离 {len(index.get('quarantine', {}))} 张")
     print(f"展示      已看过 {len(shown)} 张 / 从未 {max(0, len(images) - len(shown))} 张（历史 {len(pool_events)} 条）")
@@ -2424,7 +2611,10 @@ def cmd_ban(paths: Paths, args: argparse.Namespace) -> int:
 
 
 def fetch_item(key: str, image_id: str) -> dict:
-    payload = api_get(key, f"w/{image_id}", {})
+    try:
+        payload = api_get(key, f"w/{image_id}", {})
+    except RuntimeError as exc:
+        raise SystemExit(f"wallhaven 查不到 {image_id}：{exc}") from exc
     data = payload.get("data")
     if not isinstance(data, dict):
         raise SystemExit(f"wallhaven 查不到 {image_id}")
@@ -2453,6 +2643,7 @@ def add_item(
     target: int,
     force: bool = False,
     allow_archived: bool = False,
+    max_bytes: int = 0,
 ) -> bool:
     image_id = item["id"]
     duplicate = index["duplicates"].get(image_id)
@@ -2548,6 +2739,15 @@ def add_item(
         save_index(paths, index)
         print(f"{image_id} 未通过品控：{reason}（--force 可强制加入）")
         return False
+    if max_bytes:
+        _, used = pool_usage(paths.pool)
+        if used + size > max_bytes:
+            temporary.unlink(missing_ok=True)
+            print(
+                f"{image_id} 会超过池子容量上限"
+                f"（{format_bytes(used)} + {format_bytes(size)} > {format_bytes(max_bytes)}）"
+            )
+            return False
     final = paths.pool / f"wallhaven-{image_id}{extension_for(item)}"
     os.replace(temporary, final)
     index["images"][image_id] = {
@@ -2578,7 +2778,15 @@ def cmd_add(paths: Paths, args: argparse.Namespace) -> int:
         if not acquired:
             raise SystemExit("另一个 wallhaven-sync 正在运行")
         index = load_index(paths)
-        add_item(paths, index, item, "manual", args.target, force=args.force)
+        add_item(
+            paths,
+            index,
+            item,
+            "manual",
+            args.target,
+            force=args.force,
+            max_bytes=args.max_bytes,
+        )
     return 0
 
 
@@ -3037,6 +3245,12 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--limit", type=int, default=20, help="dry-run 时最多列出多少个候选")
     sync.add_argument("--max-pages", type=int, default=None, help="每个来源最多翻多少页")
     sync.add_argument("--page-offset", type=int, default=0, help="每个来源跳过前 N 页（默认 0）")
+    sync.add_argument(
+        "--max-bytes",
+        type=int,
+        default=_int_env("WALLHAVEN_MAX_BYTES", DEFAULT_MAX_BYTES),
+        help=f"池子字节上限（默认 {DEFAULT_MAX_BYTES // 1024**3} GiB，0 = 不限制）",
+    )
     sync.add_argument("--retry-rejected", action="store_true", help="清空拒绝记录后重新评估")
     sync.add_argument("--retry-duplicates", action="store_true", help="清空重复记录后重新评估")
     sync.add_argument("--force-prune", action="store_true", help="池子大量文件缺失时仍继续（危险）")
@@ -3077,6 +3291,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=-1,
         help="每个来源跳过前 N 页；-1 按日期轮换（默认）",
+    )
+    replenish.add_argument(
+        "--max-bytes",
+        type=int,
+        default=_int_env("WALLHAVEN_MAX_BYTES", DEFAULT_MAX_BYTES),
+        help=f"池子字节硬上限（默认 {DEFAULT_MAX_BYTES // 1024**3} GiB，0 = 不限制）",
     )
     add_source_args(replenish)
     replenish.set_defaults(func=cmd_replenish)
@@ -3134,6 +3354,12 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("id_or_url")
     add.add_argument("--target", type=int, default=_target_default())
     add.add_argument("--force", action="store_true", help="跳过品控强制加入")
+    add.add_argument(
+        "--max-bytes",
+        type=int,
+        default=_int_env("WALLHAVEN_MAX_BYTES", DEFAULT_MAX_BYTES),
+        help="池子字节上限（0 = 不限制）",
+    )
     add.set_defaults(func=cmd_add)
 
     preview = sub.add_parser("preview", help="预览某张壁纸的配色")
