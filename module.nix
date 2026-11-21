@@ -78,10 +78,24 @@ in
         can bring them back before they are purged.
       '';
     };
+
+    username = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "cyjx";
+      description = ''
+        Wallhaven account name.  When set, the daily replenish job reads the
+        account's collections (read-only) and pins their images so they are
+        never evicted.  The API has no favourites endpoint and no write access.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
     home.packages = [ package ];
+    home.sessionVariables = lib.mkIf (cfg.username != null) {
+      WALLHAVEN_USERNAME = cfg.username;
+    };
 
     systemd.user.services.wallhaven-sync = {
       Unit = {
@@ -92,7 +106,8 @@ in
       Service = {
         Type = "oneshot";
         ExecStart = "${package}/bin/wallhaven-sync replenish --max-per-day ${toString cfg.maxPerDay} --keep-trash-days ${toString cfg.trashDays}";
-        Environment = [ "PYTHONUNBUFFERED=1" ];
+        Environment = [ "PYTHONUNBUFFERED=1" ]
+          ++ lib.optional (cfg.username != null) "WALLHAVEN_USERNAME=${cfg.username}";
         Nice = 10;
         IOSchedulingClass = "idle";
         TimeoutStartSec = "6h";

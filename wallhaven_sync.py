@@ -1605,6 +1605,16 @@ def cmd_replenish(paths: Paths, args: argparse.Namespace) -> int:
         index = load_index(paths)
         if not args.dry_run:
             mirror_index_to_db(paths, index)
+            username = os.environ.get("WALLHAVEN_USERNAME", "").strip()
+            if username:
+                try:
+                    collected = fetch_collection_ids(read_key(paths), username)
+                except (RuntimeError, SystemExit) as exc:
+                    warn(f"同步收藏夹保护失败：{exc}")
+                else:
+                    pinned = db_pin_ids(paths, collected) if collected else 0
+                    if pinned:
+                        print(f"收藏夹保护：{pinned} 张在库里，已标记 pin。", flush=True)
         purge_trash(paths, args.keep_trash_days, dry_run=args.dry_run)
 
         already = db_evicted_today(paths)
@@ -1914,25 +1924,10 @@ def cmd_restore(paths: Paths, args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_collections(paths: Paths, args: argparse.Namespace) -> int:
-    """Pin every wallpaper in the user's wallhaven collections (read-only).
-
-    Wallhaven's API has no favourites endpoint (404); collections are the only
-    readable list.  Item listings need the account username, which the API does
-    not expose, so it must come from --username or WALLHAVEN_USERNAME.
-    """
-    username = args.username or os.environ.get("WALLHAVEN_USERNAME", "").strip()
-    if not username:
-        raise SystemExit(
-            "需要 wallhaven 用户名（API 不返回账号名）："
-            "--username <名字> 或设置 WALLHAVEN_USERNAME"
-        )
-    key = read_key(paths)
+def fetch_collection_ids(key: str, username: str) -> set[str]:
+    """Read every item in the user's collections (API is read-only)."""
     collected: set[str] = set()
-    try:
-        listing = api_get(key, f"collections/{username}", {})
-    except RuntimeError as exc:
-        raise SystemExit(f"读取 {username} 的收藏夹失败：{exc}") from exc
+    listing = api_get(key, f"collections/{username}", {})
     for collection in listing.get("data") or []:
         collection_id = collection.get("id")
         if collection_id is None:
@@ -1955,10 +1950,30 @@ def cmd_collections(paths: Paths, args: argparse.Namespace) -> int:
                 if item.get("id"):
                     collected.add(str(item["id"]))
             page += 1
+    return collected
+
+
+def cmd_collections(paths: Paths, args: argparse.Namespace) -> int:
+    """Pin every wallpaper in the user's wallhaven collections (read-only).
+
+    Wallhaven's API has no favourites endpoint (404); collections are the only
+    readable list.  Item listings need the account username, which the API does
+    not expose, so it must come from --username or WALLHAVEN_USERNAME.
+    """
+    username = args.username or os.environ.get("WALLHAVEN_USERNAME", "").strip()
+    if not username:
+        raise SystemExit(
+            "需要 wallhaven 用户名（API 不返回账号名）："
+            "--username <名字> 或设置 WALLHAVEN_USERNAME"
+        )
+    key = read_key(paths)
+    try:
+        collected = fetch_collection_ids(key, username)
+    except RuntimeError as exc:
+        raise SystemExit(f"读取 {username} 的收藏夹失败：{exc}") from exc
     if not collected:
         print("收藏夹是空的，或用户名不对。")
         return 0
-    pinned = 0
     with exclusive_lock(paths.lock) as acquired:
         if not acquired:
             raise SystemExit("另一个 wallhaven-sync 正在运行")

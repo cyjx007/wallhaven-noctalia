@@ -652,7 +652,7 @@ class ReplenishTest(unittest.TestCase):
                 ws, "current_wallpaper_ids", return_value=set()
             ), mock.patch.object(ws, "read_key", return_value="k" * 20), mock.patch.object(
                 ws, "enrich_evicted_tags"
-            ):
+            ), mock.patch.dict(os.environ, {"WALLHAVEN_USERNAME": ""}):
                 ws.cmd_replenish(paths, self._args())
 
             index = ws.load_index(paths)
@@ -671,11 +671,25 @@ class ReplenishTest(unittest.TestCase):
             ws.db_set_status(paths, "a1", "evicted", reason="rotation")
             with mock.patch.object(ws, "sync_locked", return_value=0) as synced, mock.patch.object(
                 ws, "current_wallpaper_ids", return_value=set()
-            ):
+            ), mock.patch.dict(os.environ, {"WALLHAVEN_USERNAME": ""}):
                 ws.cmd_replenish(paths, self._args())
             synced.assert_called_once()
             self.assertIn("a1", ws.load_index(paths)["images"])
             self.assertTrue((paths.pool / "wallhaven-a1.jpg").exists())
+
+
+class CollectionTest(unittest.TestCase):
+    def test_fetch_collection_ids_paginates(self):
+        def fake_api(_key, endpoint, params):
+            if endpoint == "collections/cyjx":
+                return {"data": [{"id": 7}]}
+            if params["page"] == "1":
+                return {"data": [{"id": "aaaaaa"}], "meta": {"last_page": 2}}
+            return {"data": [{"id": "bbbbbb"}], "meta": {"last_page": 2}}
+
+        with mock.patch.object(ws, "api_get", side_effect=fake_api):
+            ids = ws.fetch_collection_ids("key", "cyjx")
+        self.assertEqual(ids, {"aaaaaa", "bbbbbb"})
 
 
 class CurrentWallpaperTest(unittest.TestCase):

@@ -195,10 +195,15 @@ wallhaven-sync record                  # 给 Noctalia 钩子用，手动跑一�
 隔离区在池子外面，`recursive=true` 也不会被 Noctalia 扫到。被隔离的 ID 不会再次下载；
 `dedupe --restore <id>` 可以恢复。
 
-> **收藏夹限制**：Wallhaven API 没有 `/favorites`（实测 404），只有 collections 可读；
-> 且列出一个 collection 的内容需要账号用户名（API 不返回）。所以
-> `collections --username <名字>` 是“只读保护名单”的唯一实现方式；也可以直接用
-> `pin` 手动保护。
+> **收藏夹限制**：Wallhaven API 没有 `/favorites`（实测 404），星标收藏既不能读也不能写；
+> 只有 collections 可读（API 全部只读，不能自动收藏）。列出一个 collection 的内容还需要
+> 账号用户名（API 不返回）。所以：
+>
+> - 设置 `services.wallhaven.username`（或 `WALLHAVEN_USERNAME`）后，每日 `replenish`
+>   会自动读取 collections 并 `pin` 其中的图；
+> - 手动运行 `wallhaven-sync collections --username <名字>`；
+> - 也可以直接用 `pin` 手动保护。
+> - **点星标不算保护**，要把图加入 collection。
 
 ## 7. Noctalia 侧
 

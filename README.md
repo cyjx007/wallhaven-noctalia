@@ -44,6 +44,7 @@ services.wallhaven = {
   noctaliaPackage = config.programs.noctalia.package; # 可选，用于调色板品控
   maxPerDay = 24;    # 每天淘汰/补入的张数（0 = 只补不淘汰）
   trashDays = 7;     # 淘汰图在 <poolDir>-trash/ 保留几天
+  username = "alice"; # 可选：每日只读 collections 做 pin 保护名单
 };
 ```
 
@@ -215,8 +216,10 @@ wallhaven-sync record               # 给 Noctalia 钩子用
 `library.db`（历史/淘汰/pin）、`history.jsonl`。**这三样要备份**（图片可以重新下载）；
 `~/code/.dsh/tools/userdata-backup.sh` 已包含整个目录。
 
-> Wallhaven API 没有 `/favorites` 端点（实测 404），只有 collections 可读，而且需要账号
-> 用户名。`collections --username` 是唯一的“只读收藏夹保护”，也可以直接 `pin`。
+> Wallhaven API 没有 `/favorites` 端点（实测 404），星标收藏不能读也不能写；只有
+> collections 可读，而且需要账号用户名。设置 `services.wallhaven.username` 后，每日
+> replenish 会自动把 collections 里的图 pin 住；也可以手动 `collections --username`
+> 或直接 `pin`。**点星标不算保护，要把图加入 collection。**
 
 API 用 `X-API-Key` 请求头，限流 1.4s/次；索引与图片都在本地，不进 git。
 
