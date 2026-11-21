@@ -2713,6 +2713,8 @@ def cmd_report(paths: Paths, _args: argparse.Namespace) -> int:
     sources = by_source.most_common(8)
     suffix = " ..." if len(by_source) > len(sources) else ""
     print("来源      " + "  ".join(f"{source}:{count}" for source, count in sources) + suffix)
+    by_theme = Counter(entry.get("theme") or "?" for entry in index["images"].values())
+    print("题材      " + "  ".join(f"{theme}:{count}" for theme, count in by_theme.most_common(12)))
     buckets = hue_buckets(index)
     print("色相      " + " ".join(f"{i * 30:3d}°:{count:2d}" for i, count in enumerate(buckets)))
     library = db_counts(paths)
