@@ -274,6 +274,7 @@ def db_init(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE images ADD COLUMN {name} {declaration}")
     if conn.execute("PRAGMA user_version").fetchone()[0] < DB_VERSION:
         conn.execute(f"PRAGMA user_version = {DB_VERSION}")
+    conn.commit()
 
 
 @contextlib.contextmanager
@@ -1872,6 +1873,10 @@ def cmd_restore(paths: Paths, args: argparse.Namespace) -> int:
         row = db_get(paths, image_id)
         if row and row.get("status") == "banned":
             raise SystemExit(f"{image_id} 已被拉黑；先手动编辑索引里的 banned 再恢复")
+        if row and row.get("status") == "quarantine":
+            raise SystemExit(
+                f"{image_id} 在隔离区；用 wallhaven-sync dedupe --restore {image_id}"
+            )
         if row and row.get("file") and (paths.pool / row["file"]).exists():
             # The file was put back manually; just re-attach the metadata.
             entry = db_row_to_entry(row)

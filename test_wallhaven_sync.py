@@ -548,6 +548,18 @@ class TrashTest(unittest.TestCase):
             self.assertIn("abc123", ws.load_index(paths)["images"])
 
 
+    def test_restore_refuses_quarantine(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(tmp)
+            with ws.open_db(paths) as conn:
+                conn.execute(
+                    "INSERT INTO images (id, status, file) VALUES ('abc123', 'quarantine', 'x.jpg')"
+                )
+                conn.commit()
+            with self.assertRaises(SystemExit):
+                ws.cmd_restore(paths, argparse.Namespace(id="abc123", target=365))
+
+
 class AddArchivedTest(unittest.TestCase):
     def test_add_refuses_archived_id(self):
         with tempfile.TemporaryDirectory() as tmp:
