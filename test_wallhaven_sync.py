@@ -3,6 +3,7 @@
 Run: python3 -m unittest discover -s . -p 'test_*.py'
 """
 
+import argparse
 import os
 import tempfile
 import unittest
@@ -187,6 +188,35 @@ class DedupeApplyTest(unittest.TestCase):
             index = ws.load_index(paths)
             self.assertIn("bbbbbb", index["quarantine"])
             self.assertEqual(index["quarantine"]["bbbbbb"]["of"], "aaaaaa")
+
+
+class RestoreTest(unittest.TestCase):
+    def test_restore_old_quarantine_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = Path(tmp) / "pool"
+            paths = ws.Paths(pool=pool, state=Path(tmp) / "state", key_file=Path(tmp) / "key")
+            paths.quarantine.mkdir(parents=True)
+            quarantined = paths.quarantine / "wallhaven-abc123.jpg"
+            quarantined.write_bytes(b"x")
+            index = ws.new_index()
+            index["quarantine"]["abc123"] = {
+                "file": quarantined.name,
+                "of": "zzzzzz",
+                "distance": 2,
+            }
+            ws.save_index(paths, index)
+            args = argparse.Namespace(
+                apply=False,
+                threshold=7,
+                auto=3,
+                list_quarantine=False,
+                restore="abc123",
+            )
+            ws.cmd_dedupe(paths, args)
+            self.assertTrue((pool / quarantined.name).exists())
+            loaded = ws.load_index(paths)
+            self.assertIn("abc123", loaded["images"])
+            self.assertNotIn("abc123", loaded["quarantine"])
 
 
 class DuplicateSkipTest(unittest.TestCase):

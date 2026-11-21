@@ -612,8 +612,20 @@ def sync_locked(paths: Paths, args: argparse.Namespace) -> int:
         paths.pool.mkdir(parents=True, exist_ok=True)
         cleanup_incoming(paths)
 
-    missing = prune_missing(paths, index)
+    missing = [
+        image_id
+        for image_id, entry in index["images"].items()
+        if not (paths.pool / entry["file"]).exists()
+    ]
     if missing:
+        total = len(index["images"])
+        if total and (len(missing) == total or len(missing) > total // 2) and not args.force_prune:
+            raise SystemExit(
+                f"索引有 {total} 张，但池 {paths.pool} 里缺失 {len(missing)} 张；"
+                "检查挂载或 WALLHAVEN_POOL_DIR，确认后加 --force-prune 再试"
+            )
+        for image_id in missing:
+            del index["images"][image_id]
         print(f"索引里有 {len(missing)} 个文件已丢失，已移除并会重新下载。", flush=True)
         if not dry_run:
             save_index(paths, index)
@@ -720,7 +732,7 @@ def sync_locked(paths: Paths, args: argparse.Namespace) -> int:
 
             try:
                 phash = image_phash(temporary)
-            except RuntimeError as exc:
+            except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
                 warn(f"{image_id} pHash 失败：{exc}")
                 phash = None
             if phash:
@@ -768,6 +780,7 @@ def sync_locked(paths: Paths, args: argparse.Namespace) -> int:
                 "palette": palette,
             }
             hashes[digest] = image_id
+            index["duplicates"].pop(image_id, None)
             if phash:
                 phashes[image_id] = phash
             accepted += 1
@@ -840,7 +853,9 @@ def append_history(paths: Paths, event: dict) -> None:
         # line atomic and flock is only a best-effort serialisation.
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+        except OSError:
+            # NFS and some FUSE filesystems reject flock; O_APPEND is still safe
+            # for a single small line.
             pass
         try:
             handle.write(line)
@@ -1235,8 +1250,8 @@ def add_item(paths: Paths, index: dict, item: dict, source: str, target: int, fo
             return False
     try:
         phash = image_phash(temporary)
-    except RuntimeError as exc:
-        print(f"{image_id} pHash 失败：{exc}")
+    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        warn(f"{image_id} pHash 失败：{exc}")
         phash = None
     if phash:
         near_duplicate = None
@@ -1281,6 +1296,7 @@ def add_item(paths: Paths, index: dict, item: dict, source: str, target: int, fo
         "stats": stats,
         "palette": palette,
     }
+    index["duplicates"].pop(image_id, None)
     save_index(paths, index)
     print(f"已加入 {final.name}")
     return True
@@ -1403,12 +1419,15 @@ def cmd_report(paths: Paths, _args: argparse.Namespace) -> int:
     # Noctalia also fires wallpaper_changed on config reload / repeated apply;
     # count only consecutive path changes as real displays.
     pool_events: list[dict] = []
-    previous = None
+    last_path = None
     for event in raw_events:
-        key = (event.get("connector"), event.get("path"))
-        if key != previous:
-            pool_events.append(event)
-        previous = key
+        path = event.get("path")
+        if path == last_path:
+            # Noctalia also fires on config reload / repeated apply; the same
+            # path in a row is not a new display.
+            continue
+        pool_events.append(event)
+        last_path = path
     counts = Counter(str(e["id"]) for e in pool_events)
     shown = set(counts)
     never = set(index["images"]) - shown
@@ -1438,17 +1457,25 @@ def cmd_report(paths: Paths, _args: argparse.Namespace) -> int:
         print(f"未展示样例 {', '.join(sample)}")
 
     by_source = Counter(entry.get("source", "?") for entry in index["images"].values())
-    print("来源      " + "  ".join(f"{source}:{count}" for source, count in by_source.most_common()))
+    sources = by_source.most_common(8)
+    suffix = " ..." if len(by_source) > len(sources) else ""
+    print("来源      " + "  ".join(f"{source}:{count}" for source, count in sources) + suffix)
     buckets = hue_buckets(index)
     print("色相      " + " ".join(f"{i * 30:3d}°:{count:2d}" for i, count in enumerate(buckets)))
     if index.get("quarantine"):
         print(f"隔离区    {len(index['quarantine'])} 张（{paths.quarantine}）")
     if index["duplicates"]:
-        print(f"内容重复  {len(index['duplicates'])} 个 ID 被跳过")
+        blocked = blocked_duplicates(index)
+        stale = set(index["duplicates"]) - blocked
+        print(f"内容重复  {len(blocked)} 个 ID 被跳过（另有 {len(stale)} 条已失效，会重新评估）")
         for image_id, entry in list(index["duplicates"].items())[:8]:
+            distance = entry.get("distance")
+            if distance is None:
+                distance = "?" if entry.get("phash") else "SHA256"
+            state = "" if image_id in blocked else "（失效）"
             print(
                 f"  {image_id} -> {entry.get('of', '?')}"
-                f"（距离 {entry.get('distance', 'SHA256')}）"
+                f"（距离 {distance}）{state}"
             )
     return 0
 
@@ -1488,9 +1515,6 @@ def build_entry_from_file(path: Path, source: str = "restored") -> dict:
 
 
 def cmd_dedupe(paths: Paths, args: argparse.Namespace) -> int:
-    if args.auto > args.threshold:
-        raise SystemExit("--auto 不能大于 --threshold")
-
     with exclusive_lock(paths.lock) as acquired:
         if not acquired:
             raise SystemExit("另一个 wallhaven-sync 正在运行")
@@ -1519,16 +1543,39 @@ def cmd_dedupe(paths: Paths, args: argparse.Namespace) -> int:
             destination = paths.pool / entry["file"]
             if destination.exists():
                 raise SystemExit(f"池子里已有同名文件：{destination}")
+            restored = entry.get("entry")
+            if restored:
+                restored = dict(restored)
+            else:
+                # Rebuild metadata *before* moving, so a corrupt/unreadable
+                # quarantine file cannot leave the pool and index out of sync.
+                try:
+                    restored = build_entry_from_file(source, source="restored")
+                except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                    raise SystemExit(f"重建 {image_id} 元数据失败：{exc}") from exc
             paths.pool.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(source), str(destination))
-            restored = entry.get("entry") or build_entry_from_file(destination)
+            try:
+                shutil.move(str(source), str(destination))
+            except OSError as exc:
+                raise SystemExit(f"移回 {source} 失败：{exc}") from exc
             restored["file"] = destination.name
             index["images"][image_id] = restored
             del index["quarantine"][image_id]
             index["duplicates"].pop(image_id, None)
-            save_index(paths, index)
+            try:
+                save_index(paths, index)
+            except OSError as exc:
+                warn(f"保存索引失败，回滚恢复 {image_id}: {exc}")
+                try:
+                    shutil.move(str(destination), str(source))
+                except OSError as rollback:
+                    warn(f"回滚文件失败：{rollback}")
+                raise SystemExit(1) from exc
             print(f"已恢复 {image_id} -> {destination}")
             return 0
+
+        if args.auto > args.threshold:
+            raise SystemExit("--auto 不能大于 --threshold")
 
         computed = 0
         for image_id, entry in index["images"].items():
@@ -1572,6 +1619,9 @@ def cmd_dedupe(paths: Paths, args: argparse.Namespace) -> int:
                     continue
                 left_entry = index["images"][left]
                 right_entry = index["images"][right]
+                if left_entry["file"] == right_entry["file"]:
+                    warn(f"{left}/{right} 指向同一个文件 {left_entry['file']}，跳过")
+                    continue
                 left_file = paths.pool / left_entry["file"]
                 right_file = paths.pool / right_entry["file"]
                 left_exists = left_file.exists()
@@ -1588,7 +1638,12 @@ def cmd_dedupe(paths: Paths, args: argparse.Namespace) -> int:
                         if int(left_entry.get("bytes") or 0) >= int(right_entry.get("bytes") or 0)
                         else (right, left)
                     )
-                source = paths.pool / index["images"][drop]["file"]
+                keep_file = paths.pool / index["images"][keep]["file"]
+                if not keep_file.exists():
+                    warn(f"要保留的 {keep} 文件不存在，跳过 {left}/{right}")
+                    continue
+                original_entry = index["images"][drop]
+                source = paths.pool / original_entry["file"]
                 destination = paths.quarantine / source.name
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 try:
@@ -1598,18 +1653,34 @@ def cmd_dedupe(paths: Paths, args: argparse.Namespace) -> int:
                         os.replace(source, destination)
                 except OSError as exc:
                     warn(f"移动 {source} 失败：{exc}")
+                    if destination.exists() and source.exists():
+                        try:
+                            destination.unlink()
+                        except OSError:
+                            pass
                     continue
                 index["quarantine"][drop] = {
                     "file": destination.name,
                     "of": keep,
                     "distance": distance,
                     "at": now(),
-                    "entry": index["images"][drop],
+                    "entry": original_entry,
                 }
                 del index["images"][drop]
+                try:
+                    save_index(paths, index)
+                except OSError as exc:
+                    warn(f"保存索引失败，回滚 {drop}: {exc}")
+                    index["images"][drop] = original_entry
+                    del index["quarantine"][drop]
+                    try:
+                        if destination.exists() and not source.exists():
+                            shutil.move(str(destination), str(source))
+                    except OSError as rollback:
+                        warn(f"回滚文件失败：{rollback}")
+                    continue
                 quarantined.add(drop)
                 moved += 1
-                save_index(paths, index)
                 print(f"  隔离 {drop}（保留 {keep}）-> {destination}")
 
         if args.apply or computed:
@@ -1641,6 +1712,7 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--max-pages", type=int, default=None, help="每个榜单最多翻多少页")
     sync.add_argument("--retry-rejected", action="store_true", help="清空拒绝记录后重新评估")
     sync.add_argument("--retry-duplicates", action="store_true", help="清空重复记录后重新评估")
+    sync.add_argument("--force-prune", action="store_true", help="池子大量文件缺失时仍继续（危险）")
     sync.set_defaults(func=cmd_sync)
 
     status = sub.add_parser("status", help="查看池子与轮换进度")
@@ -1677,11 +1749,12 @@ def build_parser() -> argparse.ArgumentParser:
     report.set_defaults(func=cmd_report)
 
     dedupe = sub.add_parser("dedupe", help="pHash 去重（默认只报告）")
-    dedupe.add_argument("--apply", action="store_true", help="隔离距离 ≤ --auto 的重复")
+    action = dedupe.add_mutually_exclusive_group()
+    action.add_argument("--apply", action="store_true", help="隔离距离 ≤ --auto 的重复")
+    action.add_argument("--list-quarantine", action="store_true", help="列出隔离区并退出")
+    action.add_argument("--restore", metavar="ID", help="把隔离区的一张图移回池子并重建索引")
     dedupe.add_argument("--threshold", type=int, default=PHASH_SUSPECT, help="报告阈值（默认 7）")
     dedupe.add_argument("--auto", type=int, default=PHASH_AUTO_DUPLICATE, help="自动隔离阈值（默认 3）")
-    dedupe.add_argument("--list-quarantine", action="store_true", help="列出隔离区并退出")
-    dedupe.add_argument("--restore", metavar="ID", help="把隔离区的一张图移回池子并重建索引")
     dedupe.set_defaults(func=cmd_dedupe)
 
     return parser

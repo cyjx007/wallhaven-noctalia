@@ -113,8 +113,8 @@ Noctalia 提供：
 
 - 自动轮换、`wallpaper-next`、手动在 Noctalia 里选图都会记录；
 - 多显示器按 connector 分别记录；
-- Noctalia 在配置重载/重复 apply 同一路径时也会触发 hook，`report` 会按
-  `(connector, path)` 去掉连续重复，原始记录保留在 `history`；
+- Noctalia 在配置重载/重复 apply 同一路径时也会触发 hook，`report` 会去掉
+  **连续相同路径** 的事件，原始记录保留在 `history`；
 - 非池子路径（例如临时换的外部壁纸）也会记录，但 `in_pool: false`，报告会过滤；
 - O(1)、不联网、不读图。
 
@@ -135,6 +135,8 @@ Noctalia 提供：
 wallhaven-sync sync                    # 补齐到 target
 wallhaven-sync sync --dry-run          # 只列候选，不写索引/不下载
 wallhaven-sync sync --retry-rejected   # 调阈值后重新评估硬拒绝
+wallhaven-sync sync --retry-duplicates # 重新评估 pHash/SHA 重复
+wallhaven-sync sync --force-prune      # 池子大量缺失时仍继续（危险）
 wallhaven-sync status [--json]         # 数量、磁盘、色相、pHash、展示历史、轮换进度
 wallhaven-sync doctor                  # key/pool/Noctalia/Umbriel/最近日志
 wallhaven-sync preview <文件|id>       # 终端色块 + 亮度/饱和度/主色
@@ -151,13 +153,9 @@ wallhaven-sync record                  # 给 Noctalia 钩子用，手动跑一�
 ```
 
 `dedupe` 默认 **只报告**，并顺便把缺失的 pHash 缓存进 `index.json`（元数据，不动图片）。
-`--apply` 会把距离 ≤ `--auto`（默认 3）的重复移到（只有两边文件都存在时才移动；
-
-```
-<池子目录>-quarantine/duplicates/
-```
-
-例如 `<池子目录>-quarantine/duplicates/`。隔离区在池子外面，`recursive=true`
+`--apply` 会把距离 ≤ `--auto`（默认 3）的重复移到
+`<池子目录>-quarantine/duplicates/`。只有两边文件都存在时才移动；只有一侧存在时跳过该 pair。
+隔离区在池子外面，`recursive=true`
 也不会被 Noctalia 扫到。被隔离的 ID 不会再次下载；`dedupe --restore <id>` 可以恢复。
 
 ## 6. Noctalia 侧
@@ -231,6 +229,8 @@ Home Manager 模块提供：
 - **pHash 重复被拒绝**：被 `sync` 拒绝的图不在池子里，`dedupe` 看不到；
   用 `wallhaven-sync report` 看 `duplicates`（id / of / 距离），或 `sync --retry-duplicates` 重评。
 - **dedupe 后池子少一张**：`sync` 会补；或者等第二天的 timer。
+- **`sync` 报“池里缺失超过一半”**：先检查 `WALLHAVEN_POOL_DIR`/挂载；确认是故意换池再加
+  `--force-prune`。这是防止路径写错时把 365 条索引清空。
 - **history 的 in_pool 是 false**：检查 `WALLHAVEN_POOL_DIR` 是否指向真实池子；
   直接跑脚本而不经过 wrapper 时最容易出现。
 - **key 权限**：`doctor` 会检查 600。
