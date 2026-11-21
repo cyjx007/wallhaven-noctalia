@@ -218,6 +218,30 @@ class RestoreTest(unittest.TestCase):
             self.assertIn("abc123", loaded["images"])
             self.assertNotIn("abc123", loaded["quarantine"])
 
+    def test_restore_refuses_over_capacity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = Path(tmp) / "pool"
+            paths = ws.Paths(pool=pool, state=Path(tmp) / "state", key_file=Path(tmp) / "key")
+            paths.quarantine.mkdir(parents=True)
+            quarantined = paths.quarantine / "wallhaven-abc123.jpg"
+            quarantined.write_bytes(b"x" * 100)
+            (pool).mkdir()
+            index = ws.new_index()
+            index["quarantine"]["abc123"] = {"file": quarantined.name, "of": "zzzzzz"}
+            ws.save_index(paths, index)
+            args = argparse.Namespace(
+                apply=False,
+                threshold=7,
+                auto=3,
+                list_quarantine=False,
+                restore="abc123",
+                force=False,
+            )
+            with mock.patch.dict(os.environ, {"WALLHAVEN_MAX_BYTES": "50"}):
+                with self.assertRaises(SystemExit):
+                    ws.cmd_dedupe(paths, args)
+            self.assertTrue(quarantined.exists())
+
 
 class DuplicateSkipTest(unittest.TestCase):
     def test_skip_only_while_original_present(self):

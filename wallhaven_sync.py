@@ -2333,8 +2333,9 @@ def cmd_status(paths: Paths, args: argparse.Namespace) -> int:
     print(f"池子      {paths.pool}")
     print(f"状态      {paths.state}（index.json / library.db / history.jsonl）")
     print(f"数量      {len(images)}/{target} 张（磁盘 {format_bytes(disk)}，文件 {len(files)}）")
+    cap_text = format_bytes(max_bytes) if max_bytes else "不限"
     print(
-        f"容量      {format_bytes(disk)} / {format_bytes(max_bytes)}"
+        f"容量      {format_bytes(disk)} / {cap_text}"
         f"{'  ⚠ 超限' if max_bytes and disk > max_bytes else ''}"
     )
     print(f"拒绝      {len(index['rejected'])} 个    重复 {len(index['duplicates'])} 个    拉黑 {len(index['banned'])} 个")
@@ -2483,13 +2484,14 @@ def cmd_doctor(paths: Paths, _args: argparse.Namespace) -> int:
         ok("回收站还不存在（还没有淘汰过）")
     count, used = pool_usage(paths.pool)
     max_bytes = _int_env("WALLHAVEN_MAX_BYTES", DEFAULT_MAX_BYTES)
+    cap_text = format_bytes(max_bytes) if max_bytes else "不限"
     if max_bytes and used > max_bytes:
         warn_check(
-            f"池子超过容量上限（{format_bytes(used)} / {format_bytes(max_bytes)}，"
+            f"池子超过容量上限（{format_bytes(used)} / {cap_text}，"
             f"{count} 张）；跑一次 replenish 或调大 maxBytes"
         )
     else:
-        ok(f"容量 {format_bytes(used)} / {format_bytes(max_bytes)}（{count} 张）")
+        ok(f"容量 {format_bytes(used)} / {cap_text}（{count} 张）")
     if shutil.which("noctalia"):
         try:
             hooks = run(["noctalia", "msg", "config-get", "hooks"], timeout=20)
@@ -3073,6 +3075,15 @@ def cmd_dedupe(paths: Paths, args: argparse.Namespace) -> int:
             destination = paths.pool / entry["file"]
             if destination.exists():
                 raise SystemExit(f"池子里已有同名文件：{destination}")
+            max_bytes = _int_env("WALLHAVEN_MAX_BYTES", DEFAULT_MAX_BYTES)
+            if max_bytes and not getattr(args, "force", False):
+                _, used = pool_usage(paths.pool)
+                if used + source.stat().st_size > max_bytes:
+                    raise SystemExit(
+                        f"恢复会超过容量上限（{format_bytes(used)} + "
+                        f"{format_bytes(source.stat().st_size)} > {format_bytes(max_bytes)}）；"
+                        "加 --force 强制恢复"
+                    )
             restored = entry.get("entry")
             if restored:
                 restored = dict(restored)
@@ -3450,6 +3461,7 @@ def build_parser() -> argparse.ArgumentParser:
     action.add_argument("--restore", metavar="ID", help="把隔离区的一张图移回池子并重建索引")
     dedupe.add_argument("--threshold", type=int, default=PHASH_SUSPECT, help="报告阈值（默认 7）")
     dedupe.add_argument("--auto", type=int, default=PHASH_AUTO_DUPLICATE, help="自动隔离阈值（默认 3）")
+    dedupe.add_argument("--force", action="store_true", help="恢复隔离图时忽略容量上限")
     dedupe.set_defaults(func=cmd_dedupe)
 
     return parser

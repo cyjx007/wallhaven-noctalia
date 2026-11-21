@@ -91,13 +91,13 @@ in
     };
 
     maxBytes = lib.mkOption {
-      type = lib.types.ints.positive;
+      type = lib.types.ints.unsigned;
       default = 3 * 1024 * 1024 * 1024;
       description = ''
-        Hard byte cap for the active pool.  Downloads stop at the cap, and the
-        daily job evicts beyond `maxPerDay` if the pool is already over it.
-        This is independent of `target`, so a stuck eviction cannot let the
-        pool grow forever.
+        Hard byte cap for the active pool (`0` = unlimited).  Downloads stop at
+        the cap, and the daily job evicts beyond `maxPerDay` if the pool is
+        already over it.  This is independent of `target`, so a stuck eviction
+        cannot let the pool grow forever.
       '';
     };
   };
