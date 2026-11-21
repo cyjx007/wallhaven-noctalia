@@ -204,6 +204,7 @@ wallhaven-sync record                  # 给 Noctalia 钩子用，手动跑一�
 > - 手动运行 `wallhaven-sync collections --username <名字>`；
 > - 也可以直接用 `pin` 手动保护。
 > - **点星标不算保护**，要把图加入 collection。
+> - 把图移出 collection 不会自动 `unpin`；需要手动 `wallhaven-sync unpin <id>`。
 
 ## 7. Noctalia 侧
 
