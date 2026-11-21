@@ -297,6 +297,24 @@ class CapacityTest(unittest.TestCase):
             self.assertEqual(removed, [])
             self.assertEqual(len(index["images"]), 5)
 
+    def test_prunes_stale_orphan_before_evicting_managed_images(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths, index = self._setup(tmp, count=2)
+            orphan = paths.pool / "manual-extra.jpg"
+            orphan.write_bytes(b"x" * 500)
+            past = ws.time.time() - 48 * 3600
+            os.utime(orphan, (past, past))
+            ws.enforce_capacity(
+                paths,
+                index,
+                self._args(target=5, max_bytes=450),
+                set(),
+                protection_known=True,
+            )
+            self.assertEqual(len(index["images"]), 2)
+            self.assertFalse(orphan.exists())
+            self.assertTrue(any(paths.trash.rglob("manual-extra.jpg")))
+
 
 class TemporaryFileTest(unittest.TestCase):
     def test_cleanup_incoming_only_removes_stale_parts(self):

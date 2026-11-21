@@ -1706,6 +1706,13 @@ def enforce_capacity(
         over_bytes = max(0, used - max_bytes) if max_bytes else 0
         if over_count <= 0 and over_bytes <= 0 and count <= target:
             break
+        # Prefer removing stale files that are not part of the managed pool
+        # before evicting images that are still in rotation.
+        if over_bytes > 0 or count > target:
+            orphans = prune_orphans(paths, index)
+            if orphans:
+                removed.extend(orphans)
+                continue
         limit = min(50, max(over_count, 1 if over_bytes else 0))
         victims = select_victims(
             paths,
@@ -1721,16 +1728,11 @@ def enforce_capacity(
                 removed.extend(batch)
                 print(f"容量保护：额外淘汰 {len(batch)} 张。", flush=True)
                 continue
-        # No indexed image can be evicted (all pinned/current/recent); try
-        # stale orphan files before giving up.
-        orphans = prune_orphans(paths, index)
-        if not orphans:
-            warn(
-                f"容量仍超限（{format_bytes(used)} / {format_bytes(max_bytes)}，"
-                f"{count} 张），但没有可淘汰的图"
-            )
-            break
-        removed.extend(orphans)
+        warn(
+            f"容量仍超限（{format_bytes(used)} / {format_bytes(max_bytes)}，"
+            f"{count} 张），但没有可淘汰的图"
+        )
+        break
     return removed
 
 
@@ -2305,6 +2307,9 @@ def cmd_status(paths: Paths, args: argparse.Namespace) -> int:
     if args.json:
         payload = {
             "pool": str(paths.pool),
+            "index": str(paths.index),
+            "db": str(paths.db),
+            "history": str(paths.history),
             "count": len(images),
             "files": len(files),
             "target": target,
@@ -2326,6 +2331,7 @@ def cmd_status(paths: Paths, args: argparse.Namespace) -> int:
         return 0
 
     print(f"池子      {paths.pool}")
+    print(f"状态      {paths.state}（index.json / library.db / history.jsonl）")
     print(f"数量      {len(images)}/{target} 张（磁盘 {format_bytes(disk)}，文件 {len(files)}）")
     print(
         f"容量      {format_bytes(disk)} / {format_bytes(max_bytes)}"
