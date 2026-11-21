@@ -197,6 +197,7 @@ wallhaven-sync sync --retry-duplicates
 wallhaven-sync status [--json]      # 数量、磁盘、色相、DB、回收站、轮换进度
 wallhaven-sync doctor               # key/DB/钩子/Noctalia/Umbriel/最近日志
 wallhaven-sync backfill             # 回填旧索引缺少的 URL/收藏数/标签
+wallhaven-sync rehydrate            # 换机/池子丢失：按索引 ID 重下 active 图
 wallhaven-sync preview <文件|id>    # 终端色块 + 亮度
 wallhaven-sync add <id|url>         # 手动加一张（--force 跳过品控）
 wallhaven-sync ban <id>             # 删除并拉黑
@@ -225,6 +226,11 @@ wallhaven-sync record               # 给 Noctalia 钩子用
 > collections 可读，而且需要账号用户名。设置 `services.wallhaven.username` 后，每日
 > replenish 会自动把 collections 里的图 pin 住；也可以手动 `collections --username`
 > 或直接 `pin`。**点星标不算保护，要把图加入 collection。**
+
+**换机**：state 目录（index/DB/history）和 API key 会进 `userdata-backup`，图片不会。
+恢复后跑 `wallhaven-sync rehydrate` 按 ID 重新下载 active 图；或者手动把池目录一起拷过去。
+**不要两台设备实时共用同一个 index.json/library.db**——SQLite 和 flock 假设本地文件系统，
+两边同时 replenish 会互相覆盖；每台设备用独立 state，collections 做共同保护名单即可。
 
 API 用 `X-API-Key` 请求头，限流 1.4s/次；索引与图片都在本地，不进 git。
 

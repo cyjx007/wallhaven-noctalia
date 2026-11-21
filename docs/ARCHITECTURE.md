@@ -145,6 +145,17 @@ Latest（sorting=date_added）
 - SQLite 使用 WAL；复制时把 `library.db-wal` / `library.db-shm` 一起复制（整个
   目录 `cp -a` 即可），SQLite 恢复时会自动重放。
 
+## 8.5 换机与多设备
+
+- 备份只包含 state（`index.json`/`library.db`/`history.jsonl`）和 API key，不包含
+  1.4 GiB 图片。
+- 新机器恢复 state 后，池目录为空；`rehydrate` 按 active ID 重新下载，保留同一批图、
+  pin 和展示计数。不要用 `sync --force-prune` 代替，它会丢掉 pin 并重新选图。
+- **不支持两台设备实时共用一个 DB**：SQLite/`flock`/原子 rename 都假设本地文件系统；
+  Syncthing/NFS 上会锁失效、路径不一致、两边 replenish 互相覆盖。
+- 多设备推荐：各自独立 state；用 collections 做共同保护名单；迁移用备份快照 +
+  `rehydrate`。同一 API key 可以共用，但 45 次/分钟是共享额度。
+
 ## 9. 明确不做
 
 - 不实现第二个轮换器；Noctalia 的 `ShuffleState` 已经无放回。

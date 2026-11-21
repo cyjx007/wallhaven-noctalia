@@ -417,6 +417,45 @@ class SyncCapacityTest(unittest.TestCase):
             self.assertEqual(ws.pool_usage(pool)[1], 100)
 
 
+class RehydrateTest(unittest.TestCase):
+    def test_redownloads_missing_active_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = Path(tmp) / "pool"
+            paths = ws.Paths(pool=pool, state=Path(tmp) / "state", key_file=Path(tmp) / "key")
+            index = ws.new_index()
+            index["images"]["abc123"] = {
+                "file": "wallhaven-abc123.jpg",
+                "source": "toplist:1M:p1",
+                "theme": "toplist",
+                "sha256": "oldsha",
+                "phash": "0" * 16,
+                "stats": {"luma": 0.3, "stddev": 0.2, "sat": 0.4},
+                "palette": {"primary": "#336699", "hue": 210, "chroma": 40},
+                "added_at": ws.now(),
+            }
+            ws.save_index(paths, index)
+
+            def fake_download(_url, destination):
+                destination.write_bytes(b"x" * 100)
+                return 100, "newsha"
+
+            with mock.patch.object(ws, "read_key", return_value="k" * 20), mock.patch.object(
+                ws,
+                "fetch_item",
+                return_value={
+                    "id": "abc123",
+                    "path": "https://example.invalid/wallhaven-abc123.jpg",
+                    "resolution": "1920x1080",
+                },
+            ), mock.patch.object(ws, "download_with_retry", side_effect=fake_download):
+                ws.cmd_rehydrate(paths, argparse.Namespace(dry_run=False, limit=0))
+
+            self.assertTrue((pool / "wallhaven-abc123.jpg").exists())
+            loaded = ws.load_index(paths)["images"]["abc123"]
+            self.assertEqual(loaded["sha256"], "newsha")
+            self.assertEqual(loaded["bytes"], 100)
+
+
 class HelpersTest(unittest.TestCase):
     def test_extension_for_prefers_url_suffix(self):
         item = {"path": "https://w.wallhaven.cc/full/ab/wallhaven-abcd12.png", "file_type": "image/jpeg"}

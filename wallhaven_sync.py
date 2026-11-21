@@ -1917,6 +1917,82 @@ def cmd_backfill(paths: Paths, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_rehydrate(paths: Paths, args: argparse.Namespace) -> int:
+    """Re-download active images by ID, e.g. after restoring state on a new machine.
+
+    Unlike `sync`, this keeps the existing pool (same IDs, same pins); it does
+    not run quality gates and does not delete anything.
+    """
+    index = load_index(paths)
+    missing = [
+        image_id
+        for image_id, entry in index["images"].items()
+        if not (paths.pool / entry["file"]).exists()
+    ]
+    if args.limit:
+        missing = missing[: args.limit]
+    if not missing:
+        print("所有 active 文件都在池子里，不需要 rehydrate。")
+        return 0
+    if args.dry_run:
+        print(f"[dry-run] 需要重新下载 {len(missing)} 张：{' '.join(missing[:20])}")
+        return 0
+    key = read_key(paths)
+    with exclusive_lock(paths.lock) as acquired:
+        if not acquired:
+            raise SystemExit("另一个 wallhaven-sync 正在运行")
+        index = load_index(paths)
+        paths.pool.mkdir(parents=True, exist_ok=True)
+        cleanup_incoming(paths)
+        updated = 0
+        for image_id in missing:
+            entry = index["images"].get(image_id)
+            if not entry or (paths.pool / entry["file"]).exists():
+                continue
+            try:
+                item = fetch_item(key, image_id)
+            except (RuntimeError, SystemExit) as exc:
+                warn(f"{image_id} 无法查询：{exc}")
+                continue
+            temporary = paths.pool / f".incoming-{image_id}.part"
+            try:
+                size, digest = download_with_retry(item["path"], temporary)
+            except (RuntimeError, TooLarge, OSError, http.client.HTTPException) as exc:
+                temporary.unlink(missing_ok=True)
+                warn(f"{image_id} 下载失败：{exc}")
+                continue
+            old_sha = entry.get("sha256")
+            if old_sha and old_sha != digest:
+                warn(f"{image_id} 的 SHA-256 与旧索引不同（网站文件可能变了）")
+            final = paths.pool / f"wallhaven-{image_id}{extension_for(item)}"
+            os.replace(temporary, final)
+            meta = entry_metadata(item, entry.get("source") or "restored")
+            meta["theme"] = entry.get("theme") or meta["theme"]
+            meta["tags"] = entry.get("tags")
+            for name, value in meta.items():
+                if value is not None:
+                    entry[name] = value
+            entry.update({"file": final.name, "bytes": size, "sha256": digest})
+            if not entry.get("phash"):
+                try:
+                    entry["phash"] = image_phash(final)
+                except (RuntimeError, OSError, subprocess.SubprocessError):
+                    pass
+            if not entry.get("stats"):
+                try:
+                    entry["stats"] = image_stats(final)
+                except (RuntimeError, OSError, subprocess.SubprocessError):
+                    pass
+            updated += 1
+            if updated % 10 == 0:
+                save_index(paths, index)
+            print(f"[{updated}/{len(missing)}] {image_id} {final.name}", flush=True)
+        save_index(paths, index)
+        mirror_index_to_db(paths, index)
+    print(f"rehydrate 完成：{updated} 张。")
+    return 0
+
+
 def cmd_db_checkpoint(paths: Paths, _args: argparse.Namespace) -> int:
     """Flush the WAL so a plain copy of library.db is self-contained."""
     if not paths.db.exists():
@@ -3383,6 +3459,11 @@ def build_parser() -> argparse.ArgumentParser:
     backfill.add_argument("--force", action="store_true", help="已有字段也重新拉取")
     backfill.add_argument("--dry-run", action="store_true")
     backfill.set_defaults(func=cmd_backfill)
+
+    rehydrate = sub.add_parser("rehydrate", help="换机/池子丢失：按索引 ID 重新下载 active 图")
+    rehydrate.add_argument("--limit", type=int, default=0, help="最多处理多少张（0 = 全部）")
+    rehydrate.add_argument("--dry-run", action="store_true")
+    rehydrate.set_defaults(func=cmd_rehydrate)
 
     ban = sub.add_parser("ban", help="拉黑并删除一张壁纸")
     ban.add_argument("id")

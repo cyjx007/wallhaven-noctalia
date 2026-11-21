@@ -178,6 +178,7 @@ wallhaven-sync sync --max-bytes 3G    # 到容量上限停止下载
 wallhaven-sync status [--json]         # 数量、磁盘、色相、DB、回收站、轮换进度
 wallhaven-sync doctor                  # key/pool/DB/钩子/Noctalia/Umbriel/最近日志
 wallhaven-sync backfill                # 回填旧索引缺少的 URL/收藏数/标签
+wallhaven-sync rehydrate               # 换机/池子丢失：按索引 ID 重下 active 图
 wallhaven-sync db-checkpoint           # 合并 SQLite WAL（备份前）
 wallhaven-sync preview <文件|id>       # 终端色块 + 亮度/饱和度/主色
 wallhaven-sync add <id|url> [--force]  # 手动加一张；仍做 SHA/pHash 去重
@@ -267,6 +268,20 @@ Noctalia 5.5 的 `ShuffleState` 是**无放回**洗牌：365 张全部看过才�
 `library.db` 的 `images` 表额外有 `status`、`shown_count`、`first_shown_at`、
 `last_shown_at`、`pinned`、`evicted_at`、`evicted_reason`、`trash_path`、`tags`；
 `display_history` 存每次展示事件。
+
+### 换机 / 多设备
+
+- `userdata-backup.sh` 备份 `~/.local/state/wallhaven-sync/`（index/DB/history）和
+  `~/.config/wallhaven/`（API key），**不备份 1.4 GiB 图片**。
+- 新机器恢复后池目录是空的：先跑 `wallhaven-sync rehydrate`，按索引里的 active ID
+  原样重新下载（保留 pin/收藏/展示计数），不要直接 `sync --force-prune`。
+- 也可以手动把 `~/Pictures/壁纸/wallhaven/` 一起拷过去，然后直接 `status`。
+- **不要把同一个 `library.db`/`index.json` 同时给两台设备用**：SQLite、flock 和
+  index 的原子写都假设本地文件系统；实时同步会造成锁失效、路径不一致、两边同时
+  replenish 互相覆盖。每台设备各自维护独立的 state；用 collections 做共同保护名单，
+  用备份做一次性迁移。
+- 同一个 Wallhaven API key 可以给两台设备用，但 45 次/分钟是共享的；同时跑会更容易
+  触发 429（有退避，但会变慢）。
 
 ## 9. systemd
 
