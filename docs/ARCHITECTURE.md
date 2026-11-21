@@ -75,8 +75,8 @@ DB 的 `status` 是 evicted/quarantine/banned 的唯一权威。`index.json` 只
 **为什么保护最近 2 小时**：`noctalia msg wallpaper-get` 只返回默认输出，多显示器时
 可能漏掉某块屏；时间窗口是第二道保险。
 
-**幂等性**：同一天重复登录/重复 timer 不会超量淘汰。配额按 UTC 日期统计
-`evicted_reason='rotation'` 的记录。
+**幂等性**：同一天重复登录/重复 timer 不会超量淘汰。配额按**本地日期**统计
+`evicted_reason='rotation'` 的记录（DB 内时间仍是 UTC，查询时换算）。
 
 ## 5. 采集来源
 

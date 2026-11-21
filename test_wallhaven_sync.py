@@ -414,11 +414,10 @@ class DatabaseTest(unittest.TestCase):
             index = ws.new_index()
             index["images"]["abc123"] = self._entry()
             ws.mirror_index_to_db(paths, index)
-            today = ws.datetime.now(ws.timezone.utc).strftime("%Y-%m-%d")
             with ws.open_db(paths) as conn:
                 conn.execute(
                     "UPDATE images SET status='evicted', evicted_at=?, evicted_reason='rotation' WHERE id='abc123'",
-                    (f"{today}T01:02:03+00:00",),
+                    (ws.now(),),
                 )
                 conn.commit()
             self.assertEqual(ws.db_evicted_today(paths), 1)
@@ -553,6 +552,102 @@ class AddArchivedTest(unittest.TestCase):
                 365,
             )
             self.assertFalse(result)
+
+
+class ReplenishTest(unittest.TestCase):
+    def _args(self, **overrides):
+        values = {
+            "target": 3,
+            "max_per_day": 1,
+            "keep_trash_days": 7,
+            "dry_run": False,
+            "force": False,
+            "evict_unshown": False,
+            "protect_recent_hours": 2,
+            "page_offset": 0,
+            "max_pages": 2,
+            "limit": 5,
+            "tags": "",
+            "no_tags": True,
+            "include_latest": False,
+            "min_favorites": 0,
+            "min_views": 0,
+        }
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def _setup(self, tmp):
+        pool = Path(tmp) / "pool"
+        pool.mkdir()
+        paths = ws.Paths(pool=pool, state=Path(tmp) / "state", key_file=Path(tmp) / "key")
+        index = ws.new_index()
+        for image_id in ("a1", "a2", "a3"):
+            entry = {
+                "file": f"wallhaven-{image_id}.jpg",
+                "source": "toplist:1M:p1",
+                "theme": "toplist",
+                "added_at": "2026-01-01T00:00:00+00:00",
+                "bytes": 10,
+                "stats": {},
+                "palette": {},
+            }
+            (pool / entry["file"]).write_bytes(b"x" * 10)
+            index["images"][image_id] = entry
+        ws.save_index(paths, index)
+        ws.mirror_index_to_db(paths, index)
+        with ws.open_db(paths) as conn:
+            conn.execute("UPDATE images SET last_shown_at='2026-01-02T00:00:00+00:00' WHERE id='a1'")
+            conn.execute("UPDATE images SET last_shown_at=? WHERE id='a2'", (ws.now(),))
+            conn.commit()
+        return paths
+
+    def test_evicts_only_after_successful_topup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._setup(tmp)
+
+            def fake_sync(paths, sync_args):
+                index = ws.load_index(paths)
+                index["images"]["new01"] = {
+                    "file": "wallhaven-new01.jpg",
+                    "source": "toplist:1M:p1",
+                    "theme": "toplist",
+                    "added_at": ws.now(),
+                    "bytes": 10,
+                    "stats": {},
+                    "palette": {},
+                }
+                (paths.pool / "wallhaven-new01.jpg").write_bytes(b"x" * 10)
+                ws.save_index(paths, index)
+                return 0
+
+            with mock.patch.object(ws, "sync_locked", side_effect=fake_sync), mock.patch.object(
+                ws, "current_wallpaper_ids", return_value=set()
+            ), mock.patch.object(ws, "read_key", return_value="k" * 20), mock.patch.object(
+                ws, "enrich_evicted_tags"
+            ):
+                ws.cmd_replenish(paths, self._args())
+
+            index = ws.load_index(paths)
+            self.assertEqual(index["target"], 3)
+            self.assertEqual(len(index["images"]), 3)
+            self.assertNotIn("a1", index["images"])  # oldest shown evicted
+            self.assertIn("new01", index["images"])
+            self.assertIn("a2", index["images"])  # recent
+            self.assertIn("a3", index["images"])  # never shown
+            self.assertEqual(ws.db_get(paths, "a1")["status"], "evicted")
+            self.assertTrue(any(paths.trash.rglob("wallhaven-a1.jpg")))
+
+    def test_daily_quota_blocks_more_evictions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._setup(tmp)
+            ws.db_set_status(paths, "a1", "evicted", reason="rotation")
+            with mock.patch.object(ws, "sync_locked", return_value=0) as synced, mock.patch.object(
+                ws, "current_wallpaper_ids", return_value=set()
+            ):
+                ws.cmd_replenish(paths, self._args())
+            synced.assert_called_once()
+            self.assertIn("a1", ws.load_index(paths)["images"])
+            self.assertTrue((paths.pool / "wallhaven-a1.jpg").exists())
 
 
 if __name__ == "__main__":

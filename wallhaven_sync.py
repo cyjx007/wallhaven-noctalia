@@ -231,6 +231,7 @@ CREATE TABLE IF NOT EXISTS images (
     views INTEGER,
     category TEXT,
     purity TEXT,
+    created_at TEXT,
     url TEXT,
     thumb_url TEXT,
     tags TEXT,
@@ -266,6 +267,7 @@ def db_init(conn: sqlite3.Connection) -> None:
     for name, declaration in (
         ("file_type", "TEXT"),
         ("theme", "TEXT"),
+        ("created_at", "TEXT"),
         ("trash_path", "TEXT"),
     ):
         if name not in columns:
@@ -349,6 +351,7 @@ def _entry_values(image_id: str, entry: dict, status: str) -> dict:
         "views": entry.get("views"),
         "category": entry.get("category"),
         "purity": entry.get("purity"),
+        "created_at": entry.get("created_at"),
         "url": entry.get("url"),
         "thumb_url": entry.get("thumb_url"),
         "tags": tags,
@@ -379,6 +382,7 @@ def db_upsert_entry(conn: sqlite3.Connection, image_id: str, entry: dict, status
         "views=COALESCE(excluded.views, images.views), "
         "category=COALESCE(excluded.category, images.category), "
         "purity=COALESCE(excluded.purity, images.purity), "
+        "created_at=COALESCE(excluded.created_at, images.created_at), "
         "url=COALESCE(excluded.url, images.url), "
         "thumb_url=COALESCE(excluded.thumb_url, images.thumb_url), "
         "tags=COALESCE(excluded.tags, images.tags), "
@@ -598,13 +602,18 @@ def db_recently_shown(paths: Paths, hours: float) -> set[str]:
 def db_evicted_today(paths: Paths) -> int:
     if not paths.db.exists():
         return 0
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # "Today" follows the user's local timezone; evicted_at is stored in UTC.
+    local_now = datetime.now().astimezone()
+    start_local = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start = start_local.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+    end = (start_local + timedelta(days=1)).astimezone(timezone.utc).replace(microsecond=0).isoformat()
     try:
         with open_db(paths) as conn:
             return int(
                 conn.execute(
-                    "SELECT COUNT(*) FROM images WHERE evicted_at LIKE ? AND evicted_reason = 'rotation'",
-                    (f"{today}%",),
+                    "SELECT COUNT(*) FROM images WHERE evicted_at >= ? AND evicted_at < ? "
+                    "AND evicted_reason = 'rotation'",
+                    (start, end),
                 ).fetchone()[0]
             )
     except sqlite3.Error:
@@ -1567,6 +1576,14 @@ def enrich_evicted_tags(paths: Paths, key: str, image_ids: list[str]) -> None:
             db_update_tags(paths, image_id, tags)
 
 
+def set_index_target(paths: Paths, target: int) -> dict:
+    index = load_index(paths)
+    if index.get("target") != target:
+        index["target"] = target
+        save_index(paths, index)
+    return index
+
+
 def cmd_replenish(paths: Paths, args: argparse.Namespace) -> int:
     """Daily rolling window: plan victims, top up, then move victims to trash."""
     with exclusive_lock(paths.lock) as acquired:
@@ -1632,16 +1649,18 @@ def cmd_replenish(paths: Paths, args: argparse.Namespace) -> int:
             min_favorites=args.min_favorites,
             min_views=args.min_views,
         )
-        result = sync_locked(paths, sync_args)
+        try:
+            result = sync_locked(paths, sync_args)
+        except BaseException:
+            if not args.dry_run:
+                set_index_target(paths, args.target)
+            raise
+        if not args.dry_run and (result != 0 or not planned):
+            set_index_target(paths, args.target)
         if result != 0 or args.dry_run or not planned:
             return result
 
-        index = load_index(paths)
-        if index.get("target") != args.target:
-            # sync ran with target+planned (overshoot); keep the user-facing
-            # target at the real pool size.
-            index["target"] = args.target
-            save_index(paths, index)
+        index = set_index_target(paths, args.target)
         surplus = max(0, len(index["images"]) - args.target)
         if surplus <= 0:
             print("没有补到新图，保留所有旧图。", flush=True)
@@ -1822,6 +1841,7 @@ def db_row_to_entry(row: dict) -> dict:
         "views": row.get("views"),
         "category": row.get("category"),
         "purity": row.get("purity"),
+        "created_at": row.get("created_at"),
         "url": row.get("url"),
         "thumb_url": row.get("thumb_url"),
         "tags": tags,
