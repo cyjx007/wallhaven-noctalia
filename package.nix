@@ -23,7 +23,7 @@ let
 in
 stdenv.mkDerivation {
   pname = "wallhaven-sync";
-  version = "1.1.1";
+  version = "1.2.0";
 
   src = ./.;
 
@@ -41,9 +41,12 @@ stdenv.mkDerivation {
 
   installPhase = ''
     runHook preInstall
-    install -Dm755 wallhaven_sync.py $out/bin/wallhaven-sync
-    patchShebangs $out/bin/wallhaven-sync
-    wrapProgram $out/bin/wallhaven-sync \
+    install -d $out/lib/wallhaven-sync
+    cp -r wallhaven_sync $out/lib/wallhaven-sync/
+    find $out/lib/wallhaven-sync -name __pycache__ -type d -prune -exec rm -rf {} +
+    makeWrapper ${python3.interpreter} $out/bin/wallhaven-sync \
+      --add-flags "-m wallhaven_sync" \
+      --prefix PYTHONPATH : $out/lib/wallhaven-sync \
       --prefix PATH : ${runtimePath} \
       --set-default WALLHAVEN_TARGET ${toString target} ${extraDefaults}
     runHook postInstall

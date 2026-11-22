@@ -29,7 +29,7 @@ licensed and assumes a NixOS + Home Manager + Noctalia setup.
 ## Project layout
 
 ```text
-wallhaven_sync.py       CLI, API, image quality, SQLite and rolling window
+wallhaven_sync/         package: config/api/quality/db/state/sources/sync/rolling/commands/cli
 package.nix             Nix package; runs the unit tests at build time
 module.nix              Home Manager module: package, daily replenish service/timer
 fcitx5-templates/       optional fcitx5 Noctalia templates
@@ -373,8 +373,9 @@ files:
 ## Development and tests
 
 ```bash
-nix build .#          # builds the package and runs test_wallhaven_sync.py
-nix run .# -- status  # run from the working tree
+nix build .#                 # builds the package and runs test_wallhaven_sync.py
+nix run .# -- status         # run from the working tree
+python3 -m wallhaven_sync status  # run the package directly
 ```
 
 The package's `checkPhase` runs the unit tests with `python -m unittest`; CI

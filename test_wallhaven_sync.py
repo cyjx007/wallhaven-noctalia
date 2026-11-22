@@ -6,6 +6,7 @@ Run: python3 -m unittest discover -s . -p 'test_*.py'
 import argparse
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -326,7 +327,7 @@ class CapacityTest(unittest.TestCase):
             paths, index = self._setup(tmp, count=2)
             orphan = paths.pool / "manual-extra.jpg"
             orphan.write_bytes(b"x" * 500)
-            past = ws.time.time() - 48 * 3600
+            past = time.time() - 48 * 3600
             os.utime(orphan, (past, past))
             ws.enforce_capacity(
                 paths,
@@ -350,7 +351,7 @@ class TemporaryFileTest(unittest.TestCase):
             fresh = pool / ".incoming-new.part"
             stale.write_bytes(b"x")
             fresh.write_bytes(b"x")
-            past = ws.time.time() - 48 * 3600
+            past = time.time() - 48 * 3600
             os.utime(stale, (past, past))
             ws.cleanup_incoming(paths)
             self.assertFalse(stale.exists())
@@ -396,21 +397,21 @@ class SyncCapacityTest(unittest.TestCase):
                 min_favorites=0,
                 min_views=0,
             )
-            with mock.patch.object(ws, "read_key", return_value="k" * 20), mock.patch.object(
-                ws, "build_sources", return_value=[]
+            with mock.patch.object(ws.sync, "read_key", return_value="k" * 20), mock.patch.object(
+                ws.sync, "build_sources", return_value=[]
             ), mock.patch.object(
-                ws, "iter_candidates",
+                ws.sync, "iter_candidates",
                 return_value=iter((item, "toplist:1M:p1") for item in items),
             ), mock.patch.object(
-                ws, "download_with_retry", side_effect=fake_download
+                ws.sync, "download_with_retry", side_effect=fake_download
             ), mock.patch.object(
-                ws, "image_stats", return_value={"luma": 0.3, "stddev": 0.2, "sat": 0.4}
+                ws.sync, "image_stats", return_value={"luma": 0.3, "stddev": 0.2, "sat": 0.4}
             ), mock.patch.object(
-                ws, "palette_info", return_value=None
+                ws.sync, "palette_info", return_value=None
             ), mock.patch.object(
-                ws, "image_phash", return_value="0" * 16
+                ws.sync, "image_phash", return_value="0" * 16
             ), mock.patch.object(
-                ws, "judge", return_value=None
+                ws.sync, "judge", return_value=None
             ):
                 ws.sync_locked(paths, args)
             self.assertEqual(len(ws.load_index(paths)["images"]), 1)
@@ -439,15 +440,15 @@ class RehydrateTest(unittest.TestCase):
                 destination.write_bytes(b"x" * 100)
                 return 100, "newsha"
 
-            with mock.patch.object(ws, "read_key", return_value="k" * 20), mock.patch.object(
-                ws,
+            with mock.patch.object(ws.commands, "read_key", return_value="k" * 20), mock.patch.object(
+                ws.commands,
                 "fetch_item",
                 return_value={
                     "id": "abc123",
                     "path": "https://example.invalid/wallhaven-abc123.jpg",
                     "resolution": "1920x1080",
                 },
-            ), mock.patch.object(ws, "download_with_retry", side_effect=fake_download):
+            ), mock.patch.object(ws.commands, "download_with_retry", side_effect=fake_download):
                 ws.cmd_rehydrate(paths, argparse.Namespace(dry_run=False, limit=0))
 
             self.assertTrue((pool / "wallhaven-abc123.jpg").exists())
@@ -575,7 +576,7 @@ class SourceTest(unittest.TestCase):
                 "min_views": 0,
             }
         ]
-        with mock.patch.object(ws, "api_get", side_effect=fake_api):
+        with mock.patch.object(ws.sources, "api_get", side_effect=fake_api):
             list(ws.iter_candidates("key", max_pages=2, sources=sources, page_offset=3))
         self.assertEqual([call["page"] for call in calls], ["4", "5"])
 
@@ -752,7 +753,7 @@ class TrashTest(unittest.TestCase):
             new = month / "new.jpg"
             old.write_bytes(b"old")
             new.write_bytes(b"new")
-            past = ws.time.time() - 9 * 86400
+            past = time.time() - 9 * 86400
             os.utime(old, (past, past))
             removed = ws.purge_trash(paths, 7)
             self.assertEqual(removed, [old])
@@ -893,10 +894,10 @@ class ReplenishTest(unittest.TestCase):
                 ws.save_index(paths, index)
                 return 0
 
-            with mock.patch.object(ws, "sync_locked", side_effect=fake_sync), mock.patch.object(
-                ws, "current_wallpaper_ids", return_value=set()
-            ), mock.patch.object(ws, "read_key", return_value="k" * 20), mock.patch.object(
-                ws, "enrich_evicted_tags"
+            with mock.patch.object(ws.rolling, "sync_locked", side_effect=fake_sync), mock.patch.object(
+                ws.rolling, "current_wallpaper_ids", return_value=set()
+            ), mock.patch.object(ws.rolling, "read_key", return_value="k" * 20), mock.patch.object(
+                ws.rolling, "enrich_evicted_tags"
             ), mock.patch.dict(os.environ, {"WALLHAVEN_USERNAME": ""}):
                 ws.cmd_replenish(paths, self._args())
 
@@ -914,8 +915,8 @@ class ReplenishTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             paths = self._setup(tmp)
             ws.db_set_status(paths, "a1", "evicted", reason="rotation")
-            with mock.patch.object(ws, "sync_locked", return_value=0) as synced, mock.patch.object(
-                ws, "current_wallpaper_ids", return_value=set()
+            with mock.patch.object(ws.rolling, "sync_locked", return_value=0) as synced, mock.patch.object(
+                ws.rolling, "current_wallpaper_ids", return_value=set()
             ), mock.patch.dict(os.environ, {"WALLHAVEN_USERNAME": ""}):
                 ws.cmd_replenish(paths, self._args())
             synced.assert_called_once()
@@ -932,21 +933,21 @@ class CollectionTest(unittest.TestCase):
                 return {"data": [{"id": "aaaaaa"}], "meta": {"last_page": 2}}
             return {"data": [{"id": "bbbbbb"}], "meta": {"last_page": 2}}
 
-        with mock.patch.object(ws, "api_get", side_effect=fake_api):
+        with mock.patch.object(ws.api, "api_get", side_effect=fake_api):
             ids = ws.fetch_collection_ids("key", "alice")
         self.assertEqual(ids, {"aaaaaa", "bbbbbb"})
 
 
 class CurrentWallpaperTest(unittest.TestCase):
     def test_parses_noctalia_output(self):
-        with mock.patch.object(ws.shutil, "which", return_value="/bin/noctalia"), mock.patch.object(
-            ws, "run", return_value="/pool/wallhaven-abc123.jpg\n"
+        with mock.patch.object(ws.rolling.shutil, "which", return_value="/bin/noctalia"), mock.patch.object(
+            ws.rolling, "run", return_value="/pool/wallhaven-abc123.jpg\n"
         ):
             self.assertEqual(ws.current_wallpaper_ids(), {"abc123"})
 
     def test_unknown_when_command_fails(self):
-        with mock.patch.object(ws.shutil, "which", return_value="/bin/noctalia"), mock.patch.object(
-            ws, "run", side_effect=RuntimeError("boom")
+        with mock.patch.object(ws.rolling.shutil, "which", return_value="/bin/noctalia"), mock.patch.object(
+            ws.rolling, "run", side_effect=RuntimeError("boom")
         ), mock.patch.dict(os.environ, {}, clear=True):
             self.assertIsNone(ws.current_wallpaper_ids())
 
@@ -960,7 +961,7 @@ class CurrentWallpaperTest(unittest.TestCase):
             index["images"]["abc123"] = {"file": "wallhaven-abc123.jpg", "stats": {}, "palette": {}}
             ws.save_index(paths, index)
             args = argparse.Namespace(id="abc123", reason=None, force=False)
-            with mock.patch.object(ws, "current_wallpaper_ids", return_value={"abc123"}):
+            with mock.patch.object(ws.commands, "current_wallpaper_ids", return_value={"abc123"}):
                 with self.assertRaises(SystemExit):
                     ws.cmd_ban(paths, args)
             self.assertTrue((pool / "wallhaven-abc123.jpg").exists())

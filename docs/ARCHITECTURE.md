@@ -1,7 +1,7 @@
 # 架构与不变量
 
 这份文档回答三个问题：**谁拥有什么数据**、**一张图会经历哪些状态**、**哪些失败必须
-保守处理**。实现细节见 `wallhaven_sync.py`，用户命令见 `docs/CAPABILITIES.md`。
+保守处理**。实现细节见 `wallhaven_sync/` 包，用户命令见 `docs/CAPABILITIES.md`。
 
 ## 1. 设计目标
 

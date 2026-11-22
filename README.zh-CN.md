@@ -25,7 +25,7 @@ wallhaven API → 本地壁纸池 → Noctalia 轮换 → Material You 调色 �
 ## 目录结构
 
 ```text
-wallhaven_sync.py       CLI、API、品控、SQLite 与滚动窗口
+wallhaven_sync/         包：config/api/quality/db/state/sources/sync/rolling/commands/cli
 package.nix             Nix 打包；构建时跑单元测试
 module.nix              Home Manager 模块：包 + 每日 replenish service/timer
 fcitx5-templates/       fcitx5 的 Noctalia 模板（可选）
@@ -345,8 +345,9 @@ Noctalia 模板会写 `~/.config`，但 Home Manager 生成的是只读 store �
 ## 开发与测试
 
 ```bash
-nix build .#          # 构建包，并运行 test_wallhaven_sync.py
-nix run .# -- status  # 直接从工作区运行
+nix build .#                 # 构建包，并运行 test_wallhaven_sync.py
+nix run .# -- status         # 直接从工作区运行
+python3 -m wallhaven_sync status  # 直接跑包
 ```
 
 `package.nix` 的 `checkPhase` 用 `python -m unittest` 跑单元测试；CI 构建
