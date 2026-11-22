@@ -24,7 +24,10 @@ in
     target = lib.mkOption {
       type = lib.types.ints.positive;
       default = 365;
-      description = "Stop downloading once the pool reaches this many images.";
+      description = ''
+        Active pool size.  The first replenish fills the pool to this number;
+        later runs top up and evict back down to it.
+      '';
     };
 
     poolDir = lib.mkOption {

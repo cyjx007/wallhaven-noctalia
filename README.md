@@ -6,7 +6,8 @@
 wallhaven API → 本地壁纸池 → Noctalia 轮换 → Material You 调色 → 全系统模板
 ```
 
-- 采集器只做一件事：按排行榜/标签挑图、去重、品控、填满池子（默认 365 张）。
+- 工具负责：采集、API 初筛、SHA/pHash 去重、品控、**每日滚动淘汰**、SQLite
+  元数据库、pin/restore/容量控制。
 - **滚动窗口**：每天淘汰一批已经看过的旧图，补入新图，active 始终约 365 张；
   被淘汰的图进 7 天回收站，元数据留在 SQLite，可 `restore` 回来。
 - 轮换和调色全部交给 [Noctalia](https://github.com/noctalia-dev/noctalia)：它自带
@@ -20,9 +21,9 @@ wallhaven API → 本地壁纸池 → Noctalia 轮换 → Material You 调色 �
 
 | 文件 | 作用 |
 | --- | --- |
-| `wallhaven_sync.py` | 采集器（纯 Python 标准库 + ImageMagick + `noctalia theme`） |
+| `wallhaven_sync.py` | 壁纸库管理 CLI（纯 Python 标准库 + ImageMagick + `noctalia theme`） |
 | `package.nix` | 打包（含单元测试） |
-| `module.nix` | Home Manager 模块：包 + systemd service/timer |
+| `module.nix` | Home Manager 模块：包 + 每日 `replenish` service/timer |
 | `fcitx5-templates/` | 把 mellow 圆角皮肤转成 Noctalia 模板（可选） |
 | `flake.nix` | `packages` / `homeManagerModules` |
 
@@ -60,16 +61,18 @@ chmod 600 ~/.config/wallhaven/apikey
 然后：
 
 ```bash
-wallhaven-sync sync        # 首次填满池子（可中断续跑）
+wallhaven-sync sync --dry-run   # 先看候选
+wallhaven-sync sync             # 首次补满 target（可中断续跑）
 wallhaven-sync status
 wallhaven-sync doctor
 ```
 
-systemd 会每天补货，登录 5 分钟后也会补一次；池子满时秒退。
+之后交给 systemd：登录 5 分钟后和每天各跑一次 `replenish`，首次会补满，之后每天滚动
+（先补新图，再淘汰等量旧图）。也可以手动 `wallhaven-sync replenish --dry-run` 预演。
 
 ## Noctalia 侧配置
 
-采集器不碰 Noctalia 的设置，需要你自己声明（NixOS 示例）：
+这个工具不碰 Noctalia 的设置，需要你自己声明（NixOS 示例）：
 
 ```nix
 programs.noctalia.settings = {
@@ -111,7 +114,7 @@ Noctalia 5.5 的 `src/shell/wallpaper/wallpaper_shuffle_state.cpp` 已经实现�
 
 ## 品控
 
-Material You 本身保证文本对比度（实测 `on_surface/surface` 约 14:1），所以采集器只过滤
+Material You 本身保证文本对比度（实测 `on_surface/surface` 约 14:1），所以工具只过滤
 真正影响观感的东西：
 
 | 检查 | 阈值 | 拒绝原因 |
@@ -125,28 +128,62 @@ Material You 本身保证文本对比度（实测 `on_surface/surface` 约 14:1�
 `hue-quota` / `muted-quota` 是**软拒绝**：不写永久黑名单，第一遍结束后若没满，
 自动进入宽松模式再补一遍。硬拒绝（太亮/太暗/太平/太大）才会永久跳过。
 
-## 滚动窗口（每天换 24 张）
+## 每日维护：sync、replenish 和滚动窗口
 
-池子满 365 张后，`replenish` 不再只是“池满即退”，而是：
+### 首次填充 vs 每日维护
+
+| 阶段 | 谁触发 | 行为 |
+| --- | --- | --- |
+| 首次 | 手动 `sync`，或登录 5 分钟后的 timer | 补满 `target`（默认 365），不淘汰 |
+| 日常 | systemd timer 每天 + 登录 5 分钟 | `replenish`：先补新图，再淘汰等量旧图 |
+
+systemd 的 `ExecStart` 是 `replenish`，不是 `sync`。首次运行也会补满池子，之后才是每日换血；
+池子满时不会“秒退”，而是先补 N 张（允许临时超出 target），再淘汰 N 张。
+
+### sync 和 replenish 的区别
+
+| 命令 | 用途 | 会淘汰旧图？ | 受每日配额？ | timer 调用 |
+| --- | --- | --- | --- | --- |
+| `sync` | 手动补齐 / 修复缺口 | 否 | 否 | 否 |
+| `replenish` | 每日换血 | 是（移到回收站） | 是；容量超限时例外 | 是 |
+
+只想加一张：`add`；只想补缺口：`sync`；想换一批：`replenish`。
+
+### 一次 replenish 做什么
 
 ```
-选最久没展示的旧图 → 先补新图（允许临时超出 target）
-→ 只淘汰真正补到的数量 → 移到 <poolDir>-trash/YYYYMM/
-→ DB 标记 evicted → 7 天后清理文件
+1. 清理 7 天前的回收站
+2. 选最久没展示的旧图（排除当前壁纸、pin、最近 2h、未展示过的）
+3. 先补新图（临时目标 target + 候选数）
+4. 只淘汰真正补到的数量
+5. 移到 <poolDir>-trash/YYYYMM/，DB 标记 evicted
+6. 补 tags，再做 target / maxBytes 硬容量检查
+7. 把 index.target 恢复为真实 target
 ```
 
 - 默认 24 张/天，约 3 GB/月；`--max-per-day` 或模块选项 `maxPerDay` 可调。
 - **当前正在显示的壁纸不会被删**：用 `noctalia msg wallpaper-get` 确认，失败时默认放弃淘汰。
 - 从未展示过的图默认不淘汰；`--evict-unshown` 才允许。
 - 先补后删：网络失败时一张旧图都不删。
-- **硬容量上限**：默认 3 GiB；`sync` 到上限停止下载，`replenish` 超限时无视每日配额
-  继续淘汰（仍保护当前壁纸/pin/最近展示）。24 张/天只是常规换血速度。
 - 下载先写 `.incoming-*.part`，校验 + `fsync` 后才原子改名入池。
 - 被淘汰的 ID/pHash 留在 SQLite，不会重新下载回来。
-- `pin <id>` 永不淘汰；`restore <id>` 从回收站或 Wallhaven 恢复。
 
-首次运行仍然是补满 365 张；之后 systemd 每天调用一次 `replenish`，登录 5 分钟后也会跑一次，
-但同一天不会超过 `maxPerDay`。
+### 淘汰后怎么恢复
+
+```bash
+wallhaven-sync trash                 # 看回收站（7 天内）
+wallhaven-sync restore <id>          # 从回收站恢复，或重新下载
+wallhaven-sync restore <id> --force  # 超过 maxBytes 时强制恢复
+wallhaven-sync pin <id>              # 以后永不自动淘汰
+wallhaven-sync unpin <id>
+wallhaven-sync pins
+```
+
+### 容量
+
+`maxBytes`（默认 3 GiB）是独立于 `target` 的硬上限：`sync` 到上限停止下载；
+`replenish` 超限时无视每日配额继续淘汰（仍保护当前壁纸/pin/最近展示）。
+24 张/天只是常规换血速度，不是唯一的容量保护。
 
 ## 展示历史与元数据库
 
@@ -158,12 +195,15 @@ wallpaper_changed = "wallhaven-sync record"
 ```
 
 Noctalia 会传 `NOCTALIA_WALLPAPER_PATH` / `NOCTALIA_WALLPAPER_CONNECTOR`，
-`record` 往 `history.jsonl` 追加一行。自动轮换、`wallpaper-next`、手动选图都会记录；
-多显示器按 connector 分开。然后：
+`record` 往 `history.jsonl` 追加一行，同时更新 `library.db` 的 `shown_count` /
+`first_shown_at` / `last_shown_at` / `display_history`。自动轮换、`wallpaper-next`、
+手动选图都会记录；多显示器按 connector 分开。然后：
 
 ```bash
 wallhaven-sync history --limit 30
 wallhaven-sync report
+sqlite3 ~/.local/state/wallhaven-sync/library.db \
+  "select status,count(*) from images group by status;"
 ```
 
 `report` 会给出已看过/从未展示、最常展示、来源/色相分布、pHash 覆盖和隔离区。

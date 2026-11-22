@@ -23,7 +23,7 @@ let
 in
 stdenv.mkDerivation {
   pname = "wallhaven-sync";
-  version = "1.1.0";
+  version = "1.1.1";
 
   src = ./.;
 
@@ -50,7 +50,7 @@ stdenv.mkDerivation {
   '';
 
   meta = {
-    description = "Fill and inspect a wallhaven wallpaper pool for Noctalia";
+    description = "Manage a rolling wallhaven wallpaper pool for Noctalia";
     homepage = "https://github.com/cyjx007/wallhaven-noctalia";
     license = lib.licenses.mit;
     mainProgram = "wallhaven-sync";
