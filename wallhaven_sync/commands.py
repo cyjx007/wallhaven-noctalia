@@ -69,7 +69,7 @@ from .state import (
     shuffle_state_path,
 )
 from .sync import add_item, build_entry_from_file, sync_locked
-from .util import _int_env, format_bytes, warn
+from .util import _int_env, format_bytes, local_time, warn
 
 
 def cmd_sync(paths: Paths, args: argparse.Namespace) -> int:
@@ -477,7 +477,8 @@ def cmd_pins(paths: Paths, _args: argparse.Namespace) -> int:
         print("没有 pin 的图。")
         return 0
     for row in rows:
-        print(f"{row['id']}  {row['status']:<9} {row['file'] or '?':<28} 最近展示 {row['last_shown_at'] or '从未'}")
+        shown = local_time(row["last_shown_at"]) or "从未"
+        print(f"{row['id']}  {row['status']:<9} {row['file'] or '?':<28} 最近展示 {shown}")
     return 0
 
 
@@ -843,7 +844,9 @@ def cmd_history(paths: Paths, args: argparse.Namespace) -> int:
     for event in selected:
         image_id = event.get("id") or "-"
         connector = event.get("connector") or "-"
-        print(f"{event.get('at', '')}  {image_id:<8}  {connector:<8}  {event.get('path', '')}")
+        # Local clock for humans; --json keeps the raw UTC offset for scripts.
+        stamp = local_time(event.get("at")) or "-"
+        print(f"{stamp:<19}  {image_id:<8}  {connector:<8}  {event.get('path', '')}")
     return 0
 
 
@@ -884,7 +887,8 @@ def cmd_report(paths: Paths, _args: argparse.Namespace) -> int:
         f"历史事件 {len(pool_events)} 条（原始 {len(raw_events)} 条）"
     )
     if pool_events:
-        print(f"最近一次  {pool_events[-1].get('at', '')}  {pool_events[-1].get('id')}  ({pool_events[-1].get('connector') or '-'})")
+        last_at = local_time(pool_events[-1].get("at")) or "-"
+        print(f"最近一次  {last_at}  {pool_events[-1].get('id')}  ({pool_events[-1].get('connector') or '-'})")
     if counts:
         print("最常展示  " + "  ".join(f"{image_id}:{count}" for image_id, count in counts.most_common(8)))
     if never:
@@ -913,8 +917,9 @@ def cmd_report(paths: Paths, _args: argparse.Namespace) -> int:
     )
     print(f"回收站    {len(trash)} 个文件 / {format_bytes(trash_bytes)}")
     for row in db_recent_evictions(paths, 5):
+        evicted = local_time(row.get("evicted_at")) or "?"
         print(
-            f"  最近淘汰 {row.get('evicted_at') or '?'}  {row.get('id')}  "
+            f"  最近淘汰 {evicted}  {row.get('id')}  "
             f"展示 {row.get('shown_count', 0)} 次  收藏 {row.get('favorites') or 0}"
         )
     if index.get("quarantine"):

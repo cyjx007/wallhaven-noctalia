@@ -27,6 +27,9 @@
 SQLite 负责查询、历史、淘汰状态和 pin。两者通过 `mirror_index_to_db()` 单向同步：
 index 增删 → DB 跟随；DB 的 `shown_count` / `pinned` / `evicted_*` 不会被镜像覆盖。
 
+**时间戳统一存 UTC**（`now()` 带 `+00:00`），只有"本地一天"这类语义才换算
+（见 §4 的配额）；给人看的输出经 `local_time()` 转成本地时钟，`--json` 不转。
+
 ## 3. 图片状态机
 
 ```

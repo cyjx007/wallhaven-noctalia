@@ -23,7 +23,7 @@ let
 in
 stdenv.mkDerivation {
   pname = "wallhaven-sync";
-  version = "1.2.0";
+  version = "1.2.1";
 
   src = ./.;
 

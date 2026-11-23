@@ -251,6 +251,11 @@ sqlite3 ~/.local/state/wallhaven-sync/library.db \
 `report` shows seen/unseen counts, most-shown images, source and hue
 distribution, pHash coverage and quarantined images.
 
+Every stored timestamp (`index.json`, `library.db`, `history.jsonl`) is UTC with
+an explicit `+00:00` offset — that keeps day boundaries and comparisons correct
+across timezones and DST. Human-facing output (`history`, `report`, `pins`)
+renders the local clock; `--json` keeps the raw UTC value for scripts.
+
 ## pHash deduplication
 
 SHA-256 only catches byte-identical files. `dedupe` uses pHash to find visual

@@ -233,6 +233,10 @@ sqlite3 ~/.local/state/wallhaven-sync/library.db \
 
 `report` 会给出已看过/从未展示、最常展示、来源/色相分布、pHash 覆盖和隔离区。
 
+所有落盘时间戳（`index.json`、`library.db`、`history.jsonl`）都是 UTC，带显式
+`+00:00` 偏移——这样跨时区、夏令时下比较和"本地一天"的边界都不会算错。给人看的
+输出（`history`、`report`、`pins`）按本地时钟渲染，`--json` 保持原始 UTC 供脚本使用。
+
 ## pHash 去重
 
 SHA-256 只能抓字节完全相同的文件。`dedupe` 用 pHash 找视觉重复（重新压缩、缩放、轻微调色）：

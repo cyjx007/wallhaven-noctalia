@@ -8,6 +8,7 @@ import os
 import tempfile
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -486,6 +487,21 @@ class HelpersTest(unittest.TestCase):
         self.assertEqual(ws.parse_bytes("3221225472"), 3 * 1024**3)
         with self.assertRaises(argparse.ArgumentTypeError):
             ws.parse_bytes("3X")
+
+    def test_local_time_renders_stored_utc_in_local_zone(self):
+        stored = "2026-11-23T02:38:56+00:00"
+        expected = datetime.fromisoformat(stored).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        self.assertEqual(ws.local_time(stored), expected)
+        # Same instant, only the rendering changes.
+        self.assertEqual(
+            datetime.fromisoformat(ws.local_time(stored)).timestamp(),
+            datetime.fromisoformat(stored).timestamp(),
+        )
+
+    def test_local_time_passes_through_legacy_values(self):
+        self.assertEqual(ws.local_time(None), "")
+        self.assertEqual(ws.local_time(""), "")
+        self.assertEqual(ws.local_time("1"), "1")
 
     def test_api_reject_reason(self):
         self.assertEqual(ws.api_reject_reason({"purity": "nsfw"}), "not-sfw")

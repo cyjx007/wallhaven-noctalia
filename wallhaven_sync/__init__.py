@@ -13,4 +13,4 @@ from .state import *  # noqa: F401,F403
 from .sync import *  # noqa: F401,F403
 from .util import *  # noqa: F401,F403
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
